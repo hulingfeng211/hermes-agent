@@ -148,6 +148,7 @@ export { Badge } from '@/components/ui/badge'
 export { Button } from '@/components/ui/button'
 export { Checkbox } from '@/components/ui/checkbox'
 export { Codicon } from '@/components/ui/codicon'
+export { Command, CommandEmpty, CommandGroup, CommandInput, CommandItem, CommandList } from '@/components/ui/command'
 export { ConfirmDialog } from '@/components/ui/confirm-dialog'
 export {
   ContextMenu,

@@ -2614,6 +2614,32 @@ def get_plugin_command_handler(name: str) -> Optional[Callable]:
     return entry["handler"] if entry else None
 
 
+def invoke_plugin_command_handler(
+    handler: Callable,
+    raw_args: str,
+    **context: Any,
+) -> Any:
+    """Invoke a plugin command with the context its signature accepts.
+
+    The original ``fn(raw_args)`` contract remains the default. Plugins that
+    need gateway-local state may opt into named context such as ``session_id``
+    without forcing every existing command handler to accept extra arguments.
+    """
+    try:
+        parameters = inspect.signature(handler).parameters.values()
+    except (TypeError, ValueError):
+        return handler(raw_args)
+
+    accepts_kwargs = any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters)
+    accepted_names = {
+        parameter.name
+        for parameter in parameters
+        if parameter.kind in {inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY}
+    }
+    kwargs = context if accepts_kwargs else {key: value for key, value in context.items() if key in accepted_names}
+    return handler(raw_args, **kwargs)
+
+
 _PLUGIN_COMMAND_AWAIT_TIMEOUT_SECS = 30.0
 
 

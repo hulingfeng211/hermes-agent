@@ -21,6 +21,7 @@ from hermes_cli.plugins import (
     get_pre_tool_call_block_message,
     get_pre_verify_continue_message,
     has_middleware,
+    invoke_plugin_command_handler,
     resolve_plugin_command_result,
     _portable_skill_namespace,
 )
@@ -1181,6 +1182,15 @@ class TestPluginCommands:
 
 
 class TestPluginCommandResultResolution:
+
+    def test_command_context_is_opt_in_and_backward_compatible(self):
+        legacy = lambda raw_args: f"legacy:{raw_args}"
+
+        def contextual(raw_args, session_id=None):
+            return f"{session_id}:{raw_args}"
+
+        assert invoke_plugin_command_handler(legacy, "status", session_id="session-a") == "legacy:status"
+        assert invoke_plugin_command_handler(contextual, "status", session_id="session-a") == "session-a:status"
 
 
     def test_awaits_async_result_with_running_loop(self, monkeypatch):
