@@ -6241,52 +6241,6 @@ class _RecordingAgent:
         return {"final_response": "", "messages": []}
 
 
-def test_run_prompt_submit_binds_turn_metadata_for_only_that_turn(
-    monkeypatch, tmp_path
-):
-    from hermes_cli.turn_context import get_turn_metadata
-
-    observed = []
-
-    class _CapturingAgent(_RecordingAgent):
-        def run_conversation(self, prompt, **kwargs):
-            observed.append(get_turn_metadata())
-            return super().run_conversation(prompt, **kwargs)
-
-    _configure_immediate_prompt_run(monkeypatch, tmp_path)
-    monkeypatch.setattr(server, "record_turn_start", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(server, "_retire_turn_marker", lambda *_args, **_kwargs: None)
-    session = _session(
-        session_key="turn-metadata-session",
-        agent=_CapturingAgent([]),
-        running=True,
-    )
-    server._sessions["turn-metadata-sid"] = session
-    try:
-        server._run_prompt_submit(
-            "rid-1",
-            "turn-metadata-sid",
-            session,
-            "first",
-            turn_metadata={"acme.review": {"mode": "strict"}},
-        )
-        assert get_turn_metadata() == {}
-
-        with session["history_lock"]:
-            session["running"] = True
-        server._run_prompt_submit(
-            "rid-2", "turn-metadata-sid", session, "second"
-        )
-    finally:
-        server._sessions.pop("turn-metadata-sid", None)
-
-    assert observed == [
-        {"acme.review": {"mode": "strict"}},
-        {},
-    ]
-    assert get_turn_metadata() == {}
-
-
 def test_run_prompt_submit_rejects_worker_when_close_wins_publication(
     monkeypatch, tmp_path
 ):

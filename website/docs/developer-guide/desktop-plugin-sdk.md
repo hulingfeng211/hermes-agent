@@ -349,9 +349,9 @@ ctx.register({ id: 'noir', area: THEMES_AREA, data: myDesktopTheme })
 `COMPOSER_AREAS` (`top`, `bottom`, `leading`, `actions`, `attachments`,
 `middleware`) let a plugin add controls around the message composer, provide an
 attachment source, or transform a draft before it is sent (`ComposerMiddleware`
-with a `handler(draft, context) => draft | { draft, onCommit? } | null`). A raw
-draft preserves the original transform-only API; `null` cancels the operation.
-The immutable context belongs to the exact ChatBar performing the submission:
+with a `handler(draft, context) => draft | null`). Returning `null` cancels the
+operation. The immutable context belongs to the exact ChatBar performing the
+submission:
 
 ```ts
 interface ComposerContextValue {
@@ -361,70 +361,11 @@ interface ComposerContextValue {
 ```
 
 `storedSessionId` is the composer's durable queue/session key (including
-lineage-root resolution); use it for persisted per-conversation intent.
+lineage-root resolution); use it to scope per-chat intent.
 `runtimeSessionId` identifies the live gateway stream. Render contributions can
 read the same scoped value with `useComposerContext()`. Do not substitute
 `host.state.activeSessionId`: a background tile or queued session can submit
 while a different conversation is globally active.
-
-A middleware may attach bounded, JSON-safe data to one new turn through
-`draft.turnMetadata`. Top-level keys are plugin namespaces. When a plugin also
-has one-shot UI state, return `{ draft, onCommit }`: keep `handler` as a pure
-preparation step and consume that state only in `onCommit`.
-
-Hermes snapshots metadata with the submitted or queued message, transports it
-as `turn_metadata`, and exposes it to backend plugins only while that turn
-runs. It is not conversation state and is never added to the visible message,
-persisted transcript, system prompt, or provider request:
-
-```javascript
-ctx.register({
-  id: 'strict-review-intent',
-  area: COMPOSER_AREAS.middleware,
-  data: {
-    handler(draft, context) {
-      const intent = readPendingIntent(context.storedSessionId)
-
-      if (!intent) return draft
-
-      return {
-        draft: {
-          ...draft,
-          turnMetadata: {
-            ...draft.turnMetadata,
-            'acme.review': { mode: intent.mode }
-          }
-        },
-        onCommit: () => clearPendingIntent(context.storedSessionId, intent.id)
-      }
-    }
-  }
-})
-```
-
-The gateway validates the same limits authoritatively: at most 16 KiB, 32
-namespaces, 256 JSON values, and eight nesting levels. Namespace keys use
-up to 64 characters and match
-`[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*`. Metadata-bearing submissions are new turns
-only; they are queued rather than redirected into an active turn, and steering
-never carries turn metadata.
-
-`onCommit` is an admission receipt, not a send-success callback. Hermes invokes
-the aggregated callbacks once, in middleware order:
-
-- after a queued entry is successfully inserted (including a rejected redirect
-  that falls back to the queue); or
-- immediately before the first real `prompt.submit` request for a typed, voice,
-  external, or model-producing slash turn.
-
-The receipt remains consumed if the host rejects that request, so one-shot state
-cannot leak into the next turn. Retry/resume paths do not invoke it again.
-Callbacks are renderer-local and are never serialized into the queue; a queued
-turn commits at admission, then foreground/background drain only the prepared
-metadata snapshot. A local or backend-only slash command, malformed slash,
-middleware cancellation, Stop/cancel, or accepted steering does not commit.
-Callback failures are isolated and cannot undo admission or block later
-callbacks.
 
 ### Transcript directives — inline components the model addresses
 
@@ -510,6 +451,7 @@ host.state.activeSessionId  // ReadableAtom<string | null>
 host.state.awaitingResponse // ReadableAtom<boolean>  true until the first assistant payload
 host.state.busy             // ReadableAtom<boolean>  focused chat is working after a send
 host.state.busyBySession    // ReadableAtom<Record<string, boolean>>  runtime id → mid-turn
+host.state.queuedPromptCountBySession // ReadableAtom<Record<string, number>>  durable key → waiting prompts
 host.state.focusedSessionId // ReadableAtom<string | null>  (runtime id of the FOCUSED session — tile-aware; prefer for session.* RPC)
 host.state.focusedStoredSessionId // ReadableAtom<string | null>  (durable id — navigation / session-list matching)
 host.state.focusedUsage     // ReadableAtom<UsageStats | null>  (live streamed usage of the focused session, no RPC needed)
@@ -523,9 +465,8 @@ host.state.viewport         // ReadableAtom<{ width, height, narrow }>
 `host.state.gateway` is the WebSocket connection, not whether a chat turn is
 running. A session can be mid-turn while the socket is `open`; another session
 can be idle at the same time. Disable composer or plugin actions from the
-**focused session's** turn-busy (`host.state.busyBySession[sessionId]`, or that
-session's `view.$busy`) — never from `gateway`, and never from a process-global
-busy flag.
+owning session's turn-busy and queued count — never from `gateway`, and never
+from a process-global busy flag.
 
 ```ts
 host.notify({ kind, message, title?, detail?, action? })  // toast; returns id
@@ -536,6 +477,7 @@ ctx.os.openExternal(url)                   // OS default handler (browser, mail,
 ctx.os.revealPath(path)                    // reveal in Finder / Explorer → Promise<boolean>
 ctx.os.writeClipboard(text)                // system clipboard → Promise<boolean>
 host.navigate('/route')                    // hash-route navigation
+host.submitText(text, { runtimeSessionId, storedSessionId }) // native composer send; Promise<boolean>
 host.openSession(id, { profile?, intent? }) // open a stored session core-style;
                                            //   profile: soft-swap to that profile's backend first
                                            //   intent: 'in-place' (default) | 'stack' | 'tab' | 'window'
@@ -554,6 +496,15 @@ host.requestProfile<T>(route, method, params?)   // registry-routed RPC; no fore
 host.requestProfile<T>(profile, method, params?) // legacy v1/local overload
 host.request<T>(method, params?)           // active-gateway JSON-RPC — the real power
 ```
+
+`host.submitText` is for an explicit plugin UI action that needs to submit
+through the same composer middleware and gateway path as typed text. Capture
+both ids from `useComposerContext()` (or the focused-session atoms) before the
+async action starts. The host returns `false` without sending when either id is
+missing, the pair is stale or unmounted, that chat is busy, it already has
+queued prompts, or the native submit rejects. It never retargets to whichever
+chat became active later and it never bypasses middleware with a direct
+`prompt.submit` request.
 
 `host.request` is the same JSON-RPC the app itself uses (sessions, config, skills,
 cron, kanban, …). `host.requestProfile` accepts a descriptor from
@@ -930,10 +881,10 @@ not treat this pipeline as a trust boundary.
 
 | Category | Exports |
 |----------|---------|
-| Host | `host` (`.state.*`, `.notify`, `.notifyError`, `.navigate`, `.onEvent`, `.logs`, `.status`, `.restartGateway`, `.request`) |
+| Host | `host` (`.state.*`, including per-session `busyBySession` and `queuedPromptCountBySession`; `.notify`, `.notifyError`, `.navigate`, `.submitText`, `.onEvent`, `.logs`, `.status`, `.restartGateway`, `.request`) |
 | Plugin contract | `HermesPlugin`, `PluginContext`, `PluginContribution`, `PluginStorage`, `PluginOs`, `PluginRestOptions`, `PluginNativeNotificationInput`, `PluginNotificationAction`, `HermesOpenTarget`, `Contribution` |
 | Area constants | `PANES_AREA`, `ROUTES_AREA`, `SIDEBAR_NAV_AREA`, `STATUSBAR_AREAS`, `TITLEBAR_AREAS`, `PALETTE_AREA`, `KEYBINDS_AREA`, `THEMES_AREA`, `COMPOSER_AREAS` |
-| Area payloads | `RouteContribution`, `SidebarNavContribution`, `StatusbarItem`, `TitlebarTool`, `PaletteContribution`, `KeybindContribution`, `ComposerDraft`, `ComposerContextValue`, `ComposerMiddleware`, `ComposerMiddlewareOutput`, `ComposerMiddlewareResult`, `ComposerAttachmentProvider`, `TurnMetadata` |
+| Area payloads | `RouteContribution`, `SidebarNavContribution`, `StatusbarItem`, `TitlebarTool`, `PaletteContribution`, `KeybindContribution`, `ComposerContextValue`, `ComposerMiddleware`, `ComposerAttachmentProvider` |
 | React / state | `useValue`, `atom`, `computed`, `useQuery`, `useMutation`, `useQueryClient`, `queryClient`, `useComposerContext`, `Contribute` |
 | UI kit | `Button`, `Input`, `Textarea`, `Select*`, `Switch`, `Checkbox`, `SegmentedControl`, `Tabs*`, `Dialog*`, `ConfirmDialog`, `DropdownMenu*`, `ContextMenu*`, `Popover*`, `Tip`/`Tooltip*`, `Badge`, `Kbd`/`KbdGroup`, `SearchField`, `ScrollArea`, `Separator`, `Skeleton`, `GlyphSpinner`, `Loader`, `EmptyState`, `ErrorState`, `CopyButton`, `StatusDot`, `LogView`, `Codicon`, `DecodeText` |
 | Helpers | `cn`, `icons`, `haptic`, `useI18n`, `profileColor`, `profileColorSoft`, `relativeTime`, `fmtDateTime`, `fmtDayTime`, `coarseElapsed`, `evaluateRuntimeReadiness` |

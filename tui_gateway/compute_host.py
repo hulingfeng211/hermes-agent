@@ -321,29 +321,6 @@ class ComputeHost:
 
     def _handle_turn_start(self, frame: dict[str, Any]) -> None:
         sid = str(frame.get("sid") or "")
-        try:
-            from hermes_cli.turn_context import normalize_turn_metadata
-
-            turn_metadata = (
-                normalize_turn_metadata(frame["turn_metadata"])
-                if "turn_metadata" in frame
-                else {}
-            )
-        except ValueError as exc:
-            self.emit(
-                {
-                    "type": "turn.error",
-                    "sid": sid,
-                    "request_id": frame.get("request_id"),
-                    "message": str(exc),
-                }
-            )
-            return
-        frame = dict(frame)
-        if turn_metadata:
-            frame["turn_metadata"] = turn_metadata
-        else:
-            frame.pop("turn_metadata", None)
         if sid in self._sessions:
             self._handle_spike_turn_start(frame)
             return
@@ -513,7 +490,6 @@ class ComputeHost:
                 session,
                 text,
                 display_kind=frame.get("display_kind") or None,
-                turn_metadata=frame.get("turn_metadata") or None,
             )
             run_thread = session.get("_run_thread")
             if run_thread is not None and hasattr(run_thread, "join"):

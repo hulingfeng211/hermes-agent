@@ -333,7 +333,7 @@ function InlineHtmlFrame({
           // through the composer's own send path (steer/queue rules apply),
           // but the row is typed hidden — no bubble, no UI space. The widget
           // updating IS the visible response.
-          requestComposerSubmit(intent, { target: 'active', displayKind: 'hidden' })
+          void requestComposerSubmit(intent, { target: 'active', displayKind: 'hidden' })
         }
 
         return

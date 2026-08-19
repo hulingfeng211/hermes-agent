@@ -2,6 +2,8 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import type * as HermesApi from '@/hermes'
+
 import { HubSourcesDialog } from './hub-sources-dialog'
 
 const getSkillHubConfig = vi.fn()
@@ -9,7 +11,7 @@ const saveSkillHubConfig = vi.fn()
 const testSkillHubSource = vi.fn()
 
 vi.mock('@/hermes', async importOriginal => ({
-  ...(await importOriginal<typeof import('@/hermes')>()),
+  ...(await importOriginal<typeof HermesApi>()),
   getSkillHubConfig: () => getSkillHubConfig(),
   saveSkillHubConfig: (config: unknown) => saveSkillHubConfig(config),
   testSkillHubSource: (source: unknown) => testSkillHubSource(source)

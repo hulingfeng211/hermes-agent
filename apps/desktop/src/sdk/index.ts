@@ -21,6 +21,7 @@
 import { atom, computed, type ReadableAtom } from 'nanostores'
 import type { ReactNode } from 'react'
 
+import { requestComposerSubmit } from '@/app/chat/composer/focus'
 import { PRIMARY_SESSION_VIEW } from '@/app/chat/session-view'
 import { openSession, type OpenSessionIntent } from '@/app/open-session'
 import type { ClientSessionState } from '@/app/types'
@@ -34,6 +35,7 @@ import {
 import { onGatewayEvent } from '@/contrib/events'
 import { registry } from '@/contrib/registry'
 import { deleteProfile, getLogs, getStatus, type HermesGateway } from '@/hermes'
+import { $queuedPromptsBySession } from '@/store/composer-queue'
 import {
   $gateway,
   activeGatewayConnectionId,
@@ -65,14 +67,17 @@ import {
   $gatewayState,
   $messages,
   $selectedStoredSessionId,
+  $sessions,
   requestSessionResume,
+  resolveComposerSessionKey,
   setResumeExhaustedSessionId
 } from '@/store/session'
 import {
   $focusedRuntimeId,
   $focusedSessionState,
   $focusedStoredSessionId,
-  $sessionStates
+  $sessionStates,
+  $sessionTiles
 } from '@/store/session-states'
 import { runGatewayRestart } from '@/store/system-actions'
 import type { UsageStats } from '@/types/hermes'
@@ -114,6 +119,12 @@ export interface PluginProfileRoute {
   targetProfile: string
 }
 
+/** Exact ChatBar identity for a plugin-initiated native text submission. */
+export interface PluginComposerTarget {
+  runtimeSessionId: string | null
+  storedSessionId: string | null
+}
+
 /** Window geometry + the app's responsive posture, one readonly rect. */
 export interface ViewportRect {
   width: number
@@ -139,7 +150,64 @@ const $busyBySession = computed($sessionStates, states => {
   return map
 })
 
+/** Durable composer queue key -> prompts waiting to become model turns. */
+const $queuedPromptCountBySession = computed($queuedPromptsBySession, queues => {
+  const counts: Record<string, number> = {}
+
+  for (const [id, entries] of Object.entries(queues)) {
+    if (entries.length > 0) {
+      counts[id] = entries.length
+    }
+  }
+
+  return counts
+})
+
 const $viewport = atom<ViewportRect>(readViewport())
+
+interface ResolvedPluginComposerTarget {
+  runtimeSessionId: string
+  storedSessionId: string
+  target: string
+}
+
+const composerTargetForSession = ({
+  runtimeSessionId,
+  storedSessionId
+}: PluginComposerTarget): null | ResolvedPluginComposerTarget => {
+  const runtime = runtimeSessionId?.trim() || null
+  const stored = storedSessionId?.trim() || null
+
+  // Both halves are required. A runtime id alone can be recycled after resume;
+  // a stored id alone can point at a different live incarnation after an async
+  // action returns. Their pair is the ChatBar identity snapshot.
+  if (!runtime || !stored) {
+    return null
+  }
+
+  const primaryRuntime = $activeSessionId.get()
+  const primaryStored = $selectedStoredSessionId.get()
+  const sessions = $sessions.get()
+  const primaryComposerKey = resolveComposerSessionKey(primaryStored, sessions)
+
+  if (runtime === primaryRuntime && stored === primaryComposerKey) {
+    return { runtimeSessionId: runtime, storedSessionId: stored, target: 'main' }
+  }
+
+  const tile = $sessionTiles.get().find(candidate => {
+    if (resolveComposerSessionKey(candidate.storedSessionId, sessions) !== stored) {
+      return false
+    }
+
+    if (candidate.runtimeId !== runtime) {
+      return false
+    }
+
+    return true
+  })
+
+  return tile ? { runtimeSessionId: runtime, storedSessionId: stored, target: `tile:${tile.storedSessionId}` } : null
+}
 
 async function requestPluginProfile<T>(
   route: PluginProfileRoute | string,
@@ -309,6 +377,8 @@ export const host = {
     busy: readonlyAtom<boolean>($focusedBusy),
     /** Runtime session id → mid-turn. Not socket state; see `gateway`. */
     busyBySession: readonlyAtom<Record<string, boolean>>($busyBySession),
+    /** Stored composer/session key -> prompts waiting to run. Empty queues are omitted. */
+    queuedPromptCountBySession: readonlyAtom<Record<string, number>>($queuedPromptCountBySession),
     /** Registry source that owns the active gateway, when source-scoped. */
     connectionId: readonlyAtom<null | string>($activeConnectionId),
     /** Active workspace cwd ('' when detached). */
@@ -350,6 +420,35 @@ export const host = {
   /** Navigate the app router (hash routes, e.g. '/command-center?section=system'). */
   navigate: (path: string) => {
     window.location.hash = path.startsWith('#') ? path : `#${path}`
+  },
+
+  /** Submit text through an existing ChatBar's native pipeline. The target is
+   *  an identity snapshot, not "whichever chat is active now"; stale or
+   *  unmounted targets return false without contacting the gateway. */
+  submitText: async (text: string, target: PluginComposerTarget): Promise<boolean> => {
+    const resolved = composerTargetForSession(target)
+
+    if (!resolved) {
+      return false
+    }
+
+    const sessionBusy = Boolean($sessionStates.get()[resolved.runtimeSessionId]?.busy)
+    const primaryBusy = resolved.target === 'main' && PRIMARY_SESSION_VIEW.$busy.get()
+    const queued = Boolean($queuedPromptCountBySession.get()[resolved.storedSessionId])
+
+    if (sessionBusy || primaryBusy || queued) {
+      return false
+    }
+
+    return requestComposerSubmit(text, {
+      expectedSession: {
+        runtimeSessionId: resolved.runtimeSessionId,
+        storedSessionId: resolved.storedSessionId
+      },
+      preserveDraft: true,
+      requireIdle: true,
+      target: resolved.target
+    })
   },
 
   /** Open a stored session the way core surfaces do (focus an existing
@@ -719,10 +818,7 @@ export {
   type ComposerAtCompletionSource,
   type ComposerAttachmentProvider,
   type ComposerContextValue,
-  type ComposerDraft,
   type ComposerMiddleware,
-  type ComposerMiddlewareOutput,
-  type ComposerMiddlewareResult,
   useComposerContext
 } from '@/app/chat/composer/contrib'
 
@@ -905,7 +1001,6 @@ export const STATUSBAR_AREAS = { left: 'statusBar.left', right: 'statusBar.right
 export const TITLEBAR_AREAS = { center: 'titleBar.center', left: 'titleBar.left', right: 'titleBar.right' } as const
 
 export { coarseElapsed, fmtDateTime, fmtDayTime, relativeTime } from '@/lib/time'
-export type { JsonPrimitive, JsonValue, TurnMetadata } from '@/lib/turn-metadata'
 /** The transcript as a contribution area: register a named `::directive{...}`
  *  and the model can render your component inline in assistant messages. */
 export {

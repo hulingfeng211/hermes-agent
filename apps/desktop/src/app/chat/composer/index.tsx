@@ -34,7 +34,7 @@ import {
   slashArgStage
 } from './composer-utils'
 import { ContextMenu } from './context-menu'
-import { COMPOSER_AREAS, ComposerContextProvider, type ComposerContextValue, prepareComposerDraft } from './contrib'
+import { COMPOSER_AREAS, ComposerContextProvider, type ComposerContextValue, runComposerMiddleware } from './contrib'
 import { ComposerControls } from './controls'
 import { ComposerDirectiveActions } from './directive-actions'
 import { COMPOSER_DROP_ACTIVE_CLASS, COMPOSER_DROP_FADE_CLASS } from './drop-affordance'
@@ -160,27 +160,13 @@ export function ChatBar({
         return true
       }
 
-      const prepared = await prepareComposerDraft(
-        {
-          text: value,
-          attachments: options?.attachments,
-          turnMetadata: options?.turnMetadata
-        },
-        options?.composerPrepared,
-        composerContext
-      )
+      const draft = await runComposerMiddleware({ text: value, attachments: options?.attachments }, composerContext)
 
-      if (!prepared) {
+      if (!draft) {
         return false
       }
 
-      return onSubmitProp(prepared.draft.text, {
-        ...options,
-        attachments: prepared.draft.attachments,
-        turnMetadata: prepared.draft.turnMetadata,
-        composerPrepared: true,
-        ...(prepared.commit ? { commitComposerAdmission: prepared.commit } : {})
-      })
+      return onSubmitProp(draft.text, { ...options, attachments: draft.attachments })
     },
     [composerContext, onSubmitProp]
   )
@@ -328,7 +314,6 @@ export function ChatBar({
     stepQueuedEdit
   } = useComposerQueue({
     activeQueueSessionKey,
-    activeQueueSessionKeyRef,
     attachments,
     busy,
     clearDraft,

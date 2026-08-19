@@ -67,8 +67,20 @@ const cssEscape = (value: string): string => {
 }
 
 interface SubmitDetail {
+  /** First exact listener wins. A non-matching listener must not claim. */
+  claim: () => boolean
+  resolve: (accepted: boolean) => void
   target: ComposerTarget
   text: string
+  /** Re-check identity in the addressed ChatBar after the deferred dispatch. */
+  expectedSession?: {
+    runtimeSessionId: string
+    storedSessionId: string
+  }
+  /** External intent must not consume or overwrite the user's live draft. */
+  preserveDraft?: boolean
+  /** Reject instead of steering or jumping ahead of an existing queue. */
+  requireIdle?: boolean
   /** `hidden` types the persisted user row so no bubble renders — the
    *  off-screen path for widget intents. Omit for normal visible sends. */
   displayKind?: 'hidden'
@@ -264,17 +276,70 @@ export const onComposerInsertRefsRequest = (handler: (detail: InsertRefsDetail) 
  * the agent a task without the user round-tripping through the input. */
 export const requestComposerSubmit = (
   text: string,
-  { target = 'active', displayKind }: { target?: ComposerTarget | 'active'; displayKind?: 'hidden' } = {}
-) => {
+  {
+    target = 'active',
+    displayKind,
+    expectedSession,
+    preserveDraft,
+    requireIdle
+  }: {
+    target?: ComposerTarget | 'active'
+    displayKind?: 'hidden'
+    expectedSession?: SubmitDetail['expectedSession']
+    preserveDraft?: boolean
+    requireIdle?: boolean
+  } = {}
+): Promise<boolean> => {
   const trimmed = text.trim()
 
-  if (trimmed) {
+  if (!trimmed || typeof window === 'undefined') {
+    return Promise.resolve(false)
+  }
+
+  return new Promise(resolveSubmit => {
+    let claimed = false
+    let settled = false
+
+    const settle = (accepted: boolean) => {
+      if (settled) {
+        return
+      }
+
+      settled = true
+      resolveSubmit(accepted)
+    }
+
+    const claim = () => {
+      if (claimed || settled) {
+        return false
+      }
+
+      claimed = true
+
+      return true
+    }
+
     dispatch<SubmitDetail>(SUBMIT_EVENT, {
+      claim,
+      resolve: settle,
       target: resolve(target),
       text: trimmed,
-      ...(displayKind ? { displayKind } : {})
+      ...(displayKind ? { displayKind } : {}),
+      ...(expectedSession ? { expectedSession } : {}),
+      ...(preserveDraft ? { preserveDraft: true } : {}),
+      ...(requireIdle ? { requireIdle: true } : {})
     })
-  }
+
+    // `dispatch` runs one macrotask earlier. If no exact listener claimed the
+    // request during that event, fail on the next task. Once claimed, the
+    // caller follows the real async submit result; no timeout may report false
+    // while middleware or the gateway is still going to send.
+    window.setTimeout(() => {
+      if (!claimed) {
+        settle(false)
+      }
+    }, 0)
+  })
 }
 
 export const onComposerSubmitRequest = (handler: (detail: SubmitDetail) => void) =>

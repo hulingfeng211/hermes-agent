@@ -5,7 +5,7 @@ import { triggerHaptic } from '@/lib/haptics'
 import { hasClarifyRequest, skipClarifyRequest } from '@/store/clarify'
 import { clearSessionDraft, type ComposerAttachment } from '@/store/composer'
 import { resetBrowseState } from '@/store/composer-input-history'
-import type { QueuedPromptEntry } from '@/store/composer-queue'
+import { enqueueQueuedPrompt, type QueuedPromptEntry } from '@/store/composer-queue'
 import { hasMcpSetupRequest, skipMcpSetupRequest } from '@/store/mcp-setup'
 import { hasBlockingPromptRequest } from '@/store/prompts'
 
@@ -34,7 +34,7 @@ interface UseComposerSubmitArgs {
   onCancel: ChatBarProps['onCancel']
   onSteer: ChatBarProps['onSteer']
   onSubmit: ChatBarProps['onSubmit']
-  queueCurrentDraft: (snapshot?: { attachments: ComposerAttachment[]; text: string }) => boolean | Promise<boolean>
+  queueCurrentDraft: () => boolean
   queueEdit: QueueEditState | null
   queuedPrompts: QueuedPromptEntry[]
   sessionId: string | null | undefined
@@ -80,7 +80,11 @@ export function useComposerSubmit({
 
   // Shared send primitive: fire onSubmit, and if the gateway rejects (accepted
   // === false) or throws, re-load + re-stash the draft so the words survive.
-  const dispatchSubmit = (text: string, attachments?: ComposerAttachment[], displayKind?: 'hidden') => {
+  const dispatchSubmit = async (
+    text: string,
+    attachments?: ComposerAttachment[],
+    displayKind?: 'hidden'
+  ): Promise<boolean> => {
     const submittedScope = activeQueueSessionKeyRef.current
     const submittedAttachments = attachments ?? []
 
@@ -93,13 +97,27 @@ export function useComposerSubmit({
       stashAt(submittedScope, text, submittedAttachments)
     }
 
-    void Promise.resolve(
-      attachments
-        ? onSubmit(text, { attachments, composerScope: submittedScope, ...(displayKind ? { displayKind } : {}) })
-        : onSubmit(text, { composerScope: submittedScope, ...(displayKind ? { displayKind } : {}) })
-    )
-      .then(accepted => void (accepted === false ? restore() : clearSessionDraft(submittedScope)))
-      .catch(restore)
+    try {
+      const accepted = await Promise.resolve(
+        attachments
+          ? onSubmit(text, { attachments, composerScope: submittedScope, ...(displayKind ? { displayKind } : {}) })
+          : onSubmit(text, { composerScope: submittedScope, ...(displayKind ? { displayKind } : {}) })
+      )
+
+      if (accepted === false) {
+        restore()
+
+        return false
+      }
+
+      clearSessionDraft(submittedScope)
+
+      return true
+    } catch {
+      restore()
+
+      return false
+    }
   }
 
   // External "submit this prompt" requests (e.g. the review pane's agent-ship
@@ -110,12 +128,61 @@ export function useComposerSubmit({
 
   useEffect(
     () =>
-      onComposerSubmitRequest(({ target, text, displayKind }) => {
-        if (target === 'main' && !inputDisabled) {
-          dispatchSubmitRef.current(text, undefined, displayKind)
+      onComposerSubmitRequest(
+        ({ claim, displayKind, expectedSession, preserveDraft, requireIdle, resolve, target, text }) => {
+          if (target !== scope.target) {
+            return
+          }
+
+          const submittedScope = activeQueueSessionKeyRef.current
+
+          if (
+            expectedSession &&
+            (expectedSession.runtimeSessionId !== sessionId || expectedSession.storedSessionId !== submittedScope)
+          ) {
+            return
+          }
+
+          if (!claim()) {
+            return
+          }
+
+          if (inputDisabled || (requireIdle && (disabled || busy || queuedPrompts.length > 0 || Boolean(queueEdit)))) {
+            resolve(false)
+
+            return
+          }
+
+          if (preserveDraft) {
+            void Promise.resolve(
+              onSubmit(text, {
+                attachments: [],
+                composerScope: submittedScope,
+                ...(displayKind ? { displayKind } : {})
+              })
+            )
+              .then(accepted => resolve(accepted !== false))
+              .catch(() => resolve(false))
+
+            return
+          }
+
+          // Legacy external actions still restore their own text on rejection,
+          // but must never borrow attachments currently staged by the user.
+          void dispatchSubmitRef.current(text, [], displayKind).then(resolve)
         }
-      }),
-    [inputDisabled]
+      ),
+    [
+      activeQueueSessionKeyRef,
+      busy,
+      disabled,
+      inputDisabled,
+      onSubmit,
+      queueEdit,
+      queuedPrompts.length,
+      scope.target,
+      sessionId
+    ]
   )
 
   const submitDraft = () => {
@@ -191,7 +258,7 @@ export function useComposerSubmit({
       if (!attachments.length && SLASH_COMMAND_RE.test(text.trim())) {
         triggerHaptic('submit')
         clearDraft()
-        dispatchSubmit(text)
+        void dispatchSubmit(text)
       } else if (!compacting && !blockingPrompt && !attachments.length && text.trim()) {
         // Cursor-style stop-and-correct: interrupt the live turn and redirect
         // it with this text. redirect() preserves the shown reasoning/work; if
@@ -202,7 +269,7 @@ export function useComposerSubmit({
         // queue the whole payload for the next turn. Same for a turn parked on
         // an approval/sudo/secret prompt: a steer can't reach the model while
         // the tool batch is blocked, so the message runs as the next turn.
-        void queueCurrentDraft()
+        queueCurrentDraft()
       } else {
         // Stop button (the only way to reach here while busy with an empty
         // composer — empty Enter is short-circuited in the keydown handler).
@@ -217,7 +284,7 @@ export function useComposerSubmit({
       resetBrowseState(sessionId)
       clearDraft()
       scope.attachments.clear()
-      dispatchSubmit(text, submittedAttachments)
+      void dispatchSubmit(text, submittedAttachments)
     }
 
     focusInput()
@@ -240,10 +307,7 @@ export function useComposerSubmit({
 
     void Promise.resolve(onSteer(text)).then(accepted => {
       if (!accepted && activeQueueSessionKey) {
-        // A rejected redirect becomes a NEW queued turn. Admit it through the
-        // same middleware path as every other queue entry so metadata and
-        // deferred commit callbacks bind to this exact fallback turn.
-        void queueCurrentDraft({ text, attachments: [] })
+        enqueueQueuedPrompt(activeQueueSessionKey, { text, attachments: [] })
       }
     })
   }
@@ -253,7 +317,7 @@ export function useComposerSubmit({
       return
     }
 
-    void queueCurrentDraft()
+    queueCurrentDraft()
     focusInput()
   }
 

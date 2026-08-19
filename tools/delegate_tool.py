@@ -2786,14 +2786,8 @@ def _run_single_child(
         def _run_with_thread_capture():
             _worker_thread_holder["t"] = threading.current_thread()
             from agent.delegation_context import delegated_child_context
-            from hermes_cli.turn_context import _suspend_turn_metadata
 
-            # Sync, batch, and detached delegations all converge here. A child
-            # model turn must not inherit one-shot intent from its parent turn.
-            with (
-                delegated_child_context(str(getattr(child, "session_id", "") or "")),
-                _suspend_turn_metadata(),
-            ):
+            with delegated_child_context(str(getattr(child, "session_id", "") or "")):
                 return child.run_conversation(
                     user_message=goal,
                     task_id=child_task_id,
@@ -2959,14 +2953,11 @@ def _run_single_child(
                 _schema_retries = 1
                 _retry_result = None
                 try:
-                    from hermes_cli.turn_context import _suspend_turn_metadata
-
-                    with _suspend_turn_metadata():
-                        _retry_result = child.run_conversation(
-                            user_message=build_retry_message(_schema_errors),
-                            task_id=child_task_id,
-                            stream_callback=_relay_child_text,
-                        )
+                    _retry_result = child.run_conversation(
+                        user_message=build_retry_message(_schema_errors),
+                        task_id=child_task_id,
+                        stream_callback=_relay_child_text,
+                    )
                 except Exception as _retry_exc:
                     logger.warning(
                         "Subagent %d schema-retry turn failed: %s",

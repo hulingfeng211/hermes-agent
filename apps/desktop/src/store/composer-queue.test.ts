@@ -55,37 +55,6 @@ describe('composer queue store', () => {
     expect(getQueuedPrompts(SESSION_KEY)[0]?.attachments[0]).not.toBe(source[0])
   })
 
-  it('snapshots turn metadata and preserves it across edits, persistence, and migration', () => {
-    const turnMetadata = { 'acme.review': { mode: 'strict', rules: ['citations'] } }
-
-    const queued = enqueueQueuedPrompt(SESSION_KEY, {
-      attachments: [],
-      text: 'review this',
-      turnMetadata,
-      composerPrepared: true
-    })
-
-    expect(queued).not.toBeNull()
-    expect(queued?.turnMetadata).toEqual(turnMetadata)
-    expect(queued?.turnMetadata).not.toBe(turnMetadata)
-
-    turnMetadata['acme.review'].mode = 'changed later'
-    updateQueuedPrompt(SESSION_KEY, queued!.id, { text: 'review this edited' })
-    migrateQueuedPrompts(SESSION_KEY, 'session-resumed')
-
-    const migrated = getQueuedPrompts('session-resumed')[0]
-    expect(migrated).toMatchObject({
-      text: 'review this edited',
-      composerPrepared: true,
-      turnMetadata: { 'acme.review': { mode: 'strict', rules: ['citations'] } }
-    })
-
-    const persisted = JSON.parse(String(window.localStorage.getItem(QUEUE_STORAGE_KEY)))
-    expect(persisted['session-resumed'][0].turnMetadata).toEqual({
-      'acme.review': { mode: 'strict', rules: ['citations'] }
-    })
-  })
-
   it('updates and removes queued entries by id', () => {
     const first = enqueueQueuedPrompt(SESSION_KEY, { attachments: [], text: 'draft one' })
     const second = enqueueQueuedPrompt(SESSION_KEY, { attachments: [], text: 'draft two' })

@@ -95,31 +95,6 @@ describe('useBackgroundQueueDrain', () => {
     await waitFor(() => expect(getQueuedPrompts('stored-session-a')).toHaveLength(0))
   })
 
-  it('preserves prepared turn metadata while draining a background session', async () => {
-    const runtimeMap = { current: new Map([['stored-session-a', 'rt-session-a']]) }
-    const submitText = vi.fn(async () => true)
-
-    enqueueQueuedPrompt('stored-session-a', {
-      text: 'background intent',
-      attachments: [],
-      turnMetadata: { 'acme.review': { mode: 'strict' } },
-      composerPrepared: true
-    })
-
-    render(<Harness runtimeMap={runtimeMap} submitText={submitText} />)
-
-    await waitFor(() => {
-      expect(submitText).toHaveBeenCalledWith('background intent', {
-        attachments: [],
-        turnMetadata: { 'acme.review': { mode: 'strict' } },
-        composerPrepared: true,
-        fromQueue: true,
-        sessionId: 'rt-session-a',
-        storedSessionId: 'stored-session-a'
-      })
-    })
-  })
-
   it('leaves the selected session queue to the mounted ChatBar drainer', async () => {
     const runtimeMap = { current: new Map([['stored-session-a', 'rt-session-a']]) }
     const submitText = vi.fn(async () => true)

@@ -136,6 +136,7 @@ export function HubSourcesDialog({ onOpenChange, open, profile }: HubSourcesDial
     if (!open || !configQuery.data) {
       return
     }
+
     setMode(configQuery.data.mode)
     setSources(configQuery.data.sources)
     setDraft(emptyDraft())
@@ -222,6 +223,7 @@ export function HubSourcesDialog({ onOpenChange, open, profile }: HubSourcesDial
     if (mode === 'public') {
       setMode('hybrid')
     }
+
     setDraft(emptyDraft())
     setShowForm(false)
   }

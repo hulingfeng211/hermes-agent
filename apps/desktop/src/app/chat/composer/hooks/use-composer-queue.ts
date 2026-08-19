@@ -24,13 +24,11 @@ import {
 import { notify } from '@/store/notifications'
 
 import { cloneAttachments, type QueueEditState } from '../composer-utils'
-import { prepareComposerDraft } from '../contrib'
 import { useComposerScope } from '../scope'
 import type { ChatBarProps } from '../types'
 
 interface UseComposerQueueArgs {
   activeQueueSessionKey: string | null
-  activeQueueSessionKeyRef: RefObject<string | null>
   attachments: ComposerAttachment[]
   busy: boolean
   clearDraft: () => void
@@ -56,7 +54,6 @@ interface UseComposerQueueArgs {
  */
 export function useComposerQueue({
   activeQueueSessionKey,
-  activeQueueSessionKeyRef,
   attachments,
   busy,
   clearDraft,
@@ -99,7 +96,6 @@ export function useComposerQueue({
 
   const prevQueueKeyRef = useRef(activeQueueSessionKey)
   const drainingQueueRef = useRef(false)
-  const queueAdmissionRef = useRef(false)
   const drainFailuresRef = useRef(new Map<string, number>())
 
   const beginQueuedEdit = (entry: QueuedPromptEntry) => {
@@ -182,75 +178,23 @@ export function useComposerQueue({
     return true
   }
 
-  const queueCurrentDraft = useCallback(
-    async (snapshot?: { attachments: ComposerAttachment[]; text: string }) => {
-      const text = snapshot?.text ?? draftRef.current
-      const sourceAttachments = snapshot?.attachments ?? attachments
+  const queueCurrentDraft = useCallback(() => {
+    const text = draftRef.current
 
-      if (queueAdmissionRef.current || !activeQueueSessionKey || (!text.trim() && sourceAttachments.length === 0)) {
-        return false
-      }
+    if (!activeQueueSessionKey || (!text.trim() && attachments.length === 0)) {
+      return false
+    }
 
-      const queueKey = activeQueueSessionKey
-      const attachmentSnapshot = cloneAttachments(sourceAttachments)
-      queueAdmissionRef.current = true
+    if (!enqueueQueuedPrompt(activeQueueSessionKey, { text, attachments })) {
+      return false
+    }
 
-      try {
-        const prepared = await prepareComposerDraft({ text, attachments: attachmentSnapshot }, false, {
-          runtimeSessionId: sessionId ?? null,
-          storedSessionId: queueSessionKey ?? null
-        })
+    clearDraft()
+    scope.attachments.clear()
+    triggerHaptic('selection')
 
-        if (
-          !prepared ||
-          !enqueueQueuedPrompt(queueKey, {
-            text: prepared.draft.text,
-            attachments: prepared.draft.attachments ?? [],
-            turnMetadata: prepared.draft.turnMetadata,
-            composerPrepared: true
-          })
-        ) {
-          return false
-        }
-
-        // A queued prompt becomes a real future turn at admission. Commit here,
-        // after the durable queue snapshot succeeds; drain/retry must not repeat
-        // renderer-local middleware effects.
-        prepared.commit?.()
-
-        // Middleware may be async. Clear only the snapshot the user queued; if
-        // they already started another draft while it ran, leave the newer input
-        // and attachments untouched.
-        if (!snapshot && activeQueueSessionKeyRef.current === queueKey && draftRef.current === text) {
-          clearDraft()
-        }
-
-        if (
-          !snapshot &&
-          activeQueueSessionKeyRef.current === queueKey &&
-          scope.attachments.$attachments.get() === attachments
-        ) {
-          scope.attachments.clear()
-        }
-
-        triggerHaptic('selection')
-
-        return true
-      } finally {
-        queueAdmissionRef.current = false
-      }
-    },
-    [
-      activeQueueSessionKey,
-      activeQueueSessionKeyRef,
-      attachments,
-      clearDraft,
-      draftRef,
-      queueSessionKey,
-      scope.attachments,
-      sessionId
-    ]
-  )
+    return true
+  }, [activeQueueSessionKey, attachments, clearDraft, draftRef, scope.attachments])
 
   // All queue drain paths share one lock + send-then-remove sequence.
   // `pickEntry` lets each caller choose head, by-id, or skip-edited.
@@ -275,8 +219,6 @@ export function useComposerQueue({
           onSubmit(entry.text, {
             attachments: entry.attachments,
             ...(entry.displayText ? { displayText: entry.displayText } : {}),
-            ...(entry.turnMetadata ? { turnMetadata: entry.turnMetadata } : {}),
-            ...(entry.composerPrepared ? { composerPrepared: true } : {}),
             fromQueue: true,
             sessionId: drainRuntimeSessionId,
             storedSessionId: drainQueueSessionKey

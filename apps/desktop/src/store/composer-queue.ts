@@ -1,7 +1,6 @@
 import { atom } from 'nanostores'
 
 import { SLASH_COMMAND_RE } from '@/lib/chat-runtime'
-import { cloneTurnMetadata, type TurnMetadata } from '@/lib/turn-metadata'
 
 import type { ComposerAttachment } from './composer'
 
@@ -13,11 +12,6 @@ export interface QueuedPromptEntry {
    *  expanded skill body as `text` — the UI shows the invocation instead. */
   displayText?: string
   attachments: ComposerAttachment[]
-  /** Snapshotted with the prompt at admission so later composer state cannot
-   * affect this queued turn. */
-  turnMetadata?: TurnMetadata
-  /** The composer middleware chain already produced this entry. */
-  composerPrepared?: true
   queuedAt: number
 }
 
@@ -131,13 +125,7 @@ export const getQueuedPrompts = (key: string | null | undefined): QueuedPromptEn
 
 export const enqueueQueuedPrompt = (
   key: string | null | undefined,
-  payload: {
-    text: string
-    attachments: ComposerAttachment[]
-    displayText?: string
-    turnMetadata?: TurnMetadata
-    composerPrepared?: true
-  }
+  payload: { text: string; attachments: ComposerAttachment[]; displayText?: string }
 ): null | QueuedPromptEntry => {
   const sid = sidOf(key)
 
@@ -145,15 +133,11 @@ export const enqueueQueuedPrompt = (
     return null
   }
 
-  const turnMetadata = cloneTurnMetadata(payload.turnMetadata)
-
   const entry: QueuedPromptEntry = {
     id: nextId(),
     text: payload.text,
     ...(payload.displayText ? { displayText: payload.displayText } : {}),
     attachments: cloneAttachments(payload.attachments),
-    ...(turnMetadata ? { turnMetadata } : {}),
-    ...(payload.composerPrepared ? { composerPrepared: true } : {}),
     queuedAt: Date.now()
   }
 

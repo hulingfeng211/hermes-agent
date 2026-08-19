@@ -1,8 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import { onComposerSubmitRequest } from '@/app/chat/composer/focus'
 import { createClientSessionState } from '@/lib/chat-runtime'
-import { $gatewayState } from '@/store/session'
-import { $sessionStates, dropSessionState, publishSessionState } from '@/store/session-states'
+import { $queuedPromptsBySession } from '@/store/composer-queue'
+import { $gatewayState, setActiveSessionId, setSelectedStoredSessionId } from '@/store/session'
+import { $sessionStates, $sessionTiles, dropSessionState, publishSessionState } from '@/store/session-states'
 
 import { host } from './index'
 
@@ -132,6 +134,10 @@ describe('host.state focused-session atoms', () => {
 describe('host.state busy vs gateway', () => {
   afterEach(() => {
     $sessionStates.set({})
+    $sessionTiles.set([])
+    $queuedPromptsBySession.set({})
+    setActiveSessionId(null)
+    setSelectedStoredSessionId(null)
     $gatewayState.set('idle')
   })
 
@@ -149,5 +155,86 @@ describe('host.state busy vs gateway', () => {
     dropSessionState('runtime-a')
     expect(host.state.busyBySession.get()['runtime-a']).toBeUndefined()
     expect(host.state.gateway.get()).toBe('open')
+  })
+
+  it('exposes non-empty composer queue counts by durable session key', () => {
+    $queuedPromptsBySession.set({
+      'stored-a': [
+        { id: 'queued-1', text: 'first', attachments: [], queuedAt: 1 },
+        { id: 'queued-2', text: 'second', attachments: [], queuedAt: 2 }
+      ],
+      'stored-empty': []
+    })
+
+    expect(host.state.queuedPromptCountBySession.get()).toEqual({ 'stored-a': 2 })
+
+    $queuedPromptsBySession.set({})
+    expect(host.state.queuedPromptCountBySession.get()).toEqual({})
+  })
+
+  it('submits only to the exact main or tile composer identity', async () => {
+    const targets: string[] = []
+
+    const off = onComposerSubmitRequest(detail => {
+      if (!detail.claim()) {
+        return
+      }
+
+      targets.push(detail.target)
+      detail.resolve(true)
+    })
+
+    setActiveSessionId('runtime-main')
+    setSelectedStoredSessionId('stored-main')
+    $sessionTiles.set([{ runtimeId: 'runtime-tile', storedSessionId: 'stored-tile' }])
+
+    await expect(
+      host.submitText('partial identity', {
+        runtimeSessionId: 'runtime-main',
+        storedSessionId: null
+      })
+    ).resolves.toBe(false)
+
+    publishSessionState('runtime-main', { ...createClientSessionState('stored-main'), busy: true })
+    await expect(
+      host.submitText('busy question', {
+        runtimeSessionId: 'runtime-main',
+        storedSessionId: 'stored-main'
+      })
+    ).resolves.toBe(false)
+    dropSessionState('runtime-main')
+
+    $queuedPromptsBySession.set({
+      'stored-main': [{ id: 'queued-1', text: 'first', attachments: [], queuedAt: 1 }]
+    })
+    await expect(
+      host.submitText('out-of-order question', {
+        runtimeSessionId: 'runtime-main',
+        storedSessionId: 'stored-main'
+      })
+    ).resolves.toBe(false)
+    $queuedPromptsBySession.set({})
+
+    await expect(
+      host.submitText('main question', {
+        runtimeSessionId: 'runtime-main',
+        storedSessionId: 'stored-main'
+      })
+    ).resolves.toBe(true)
+    await expect(
+      host.submitText('tile question', {
+        runtimeSessionId: 'runtime-tile',
+        storedSessionId: 'stored-tile'
+      })
+    ).resolves.toBe(true)
+    await expect(
+      host.submitText('stale question', {
+        runtimeSessionId: 'runtime-stale',
+        storedSessionId: 'stored-main'
+      })
+    ).resolves.toBe(false)
+
+    expect(targets).toEqual(['main', 'tile:stored-tile'])
+    off()
   })
 })

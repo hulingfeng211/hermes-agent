@@ -20,7 +20,9 @@ interface SubmitHarnessOptions {
   attachments?: ComposerAttachment[]
   busy?: boolean
   compacting?: boolean
-  steerAccepted?: boolean
+  disabled?: boolean
+  inputDisabled?: boolean
+  queued?: boolean
   text?: string
 }
 
@@ -28,7 +30,9 @@ function renderSubmitHook({
   attachments = [],
   busy = false,
   compacting = false,
-  steerAccepted = true,
+  disabled = false,
+  inputDisabled = false,
+  queued = false,
   text = ''
 }: SubmitHarnessOptions = {}) {
   const draftRef = { current: text }
@@ -37,9 +41,11 @@ function renderSubmitHook({
   editor.textContent = text
   const editorRef = { current: editor }
   const onCancel = vi.fn()
-  const onSteer = vi.fn(async () => steerAccepted)
+  const onSteer = vi.fn(async () => true)
   const onSubmit = vi.fn(async () => true)
   const queueCurrentDraft = vi.fn(() => true)
+  const loadIntoComposer = vi.fn()
+  const stashAt = vi.fn()
 
   const clearDraft = vi.fn(() => {
     draftRef.current = ''
@@ -54,27 +60,27 @@ function renderSubmitHook({
       busy,
       compacting,
       clearDraft,
-      disabled: false,
+      disabled,
       draftRef,
       drainNextQueued: vi.fn(async () => false),
       editorRef,
       exitQueuedEdit: vi.fn(() => false),
       focusInput: vi.fn(),
-      inputDisabled: false,
-      loadIntoComposer: vi.fn(),
+      inputDisabled,
+      loadIntoComposer,
       onCancel,
       onSteer,
       onSubmit,
       queueCurrentDraft,
       queueEdit: null,
-      queuedPrompts: [],
+      queuedPrompts: queued ? [{ id: 'queued-1', text: 'first', attachments: [], queuedAt: 1 }] : [],
       sessionId: 'runtime-session',
       setComposerText: vi.fn(),
-      stashAt: vi.fn()
+      stashAt
     })
   )
 
-  return { clearDraft, hook, onCancel, onSteer, onSubmit, queueCurrentDraft }
+  return { clearDraft, hook, loadIntoComposer, onCancel, onSteer, onSubmit, queueCurrentDraft, stashAt }
 }
 
 describe('useComposerSubmit busy-turn routing', () => {
@@ -95,28 +101,6 @@ describe('useComposerSubmit busy-turn routing', () => {
 
     await waitFor(() => expect(onSteer).toHaveBeenCalledWith('change course'))
     expect(queueCurrentDraft).not.toHaveBeenCalled()
-    expect(onCancel).not.toHaveBeenCalled()
-    expect(onSubmit).not.toHaveBeenCalled()
-  })
-
-  it('admits a rejected steer fallback through the new-turn queue path', async () => {
-    const { hook, onCancel, onSteer, onSubmit, queueCurrentDraft } = renderSubmitHook({
-      busy: true,
-      steerAccepted: false,
-      text: 'keep this as the next turn'
-    })
-
-    act(() => {
-      hook.result.current.submitDraft()
-    })
-
-    await waitFor(() =>
-      expect(queueCurrentDraft).toHaveBeenCalledWith({
-        attachments: [],
-        text: 'keep this as the next turn'
-      })
-    )
-    expect(onSteer).toHaveBeenCalledWith('keep this as the next turn')
     expect(onCancel).not.toHaveBeenCalled()
     expect(onSubmit).not.toHaveBeenCalled()
   })
@@ -218,17 +202,140 @@ describe('useComposerSubmit busy-turn routing', () => {
       expect(onSubmit).toHaveBeenCalledWith('hello', expect.objectContaining({ composerScope: 'stored-session' }))
     )
   })
+})
 
-  it('routes an external submit request through the same composer submit callback', async () => {
+describe('external composer submission', () => {
+  afterEach(() => {
+    cleanup()
+    vi.restoreAllMocks()
+  })
+
+  it('returns the native submit result for the addressed composer', async () => {
     const { onSubmit } = renderSubmitHook()
 
-    act(() => {
-      requestComposerSubmit('ship the review changes', { target: 'main' })
+    await expect(requestComposerSubmit('resume this question', { target: 'main' })).resolves.toBe(true)
+    expect(onSubmit).toHaveBeenCalledWith(
+      'resume this question',
+      expect.objectContaining({ composerScope: 'stored-session' })
+    )
+  })
+
+  it('returns false and restores text when the native submit rejects', async () => {
+    const { loadIntoComposer, onSubmit, stashAt } = renderSubmitHook()
+    onSubmit.mockResolvedValueOnce(false)
+
+    await expect(requestComposerSubmit('retry this question', { target: 'main' })).resolves.toBe(false)
+    expect(loadIntoComposer).toHaveBeenCalledWith('retry this question', [])
+    expect(stashAt).toHaveBeenCalledWith('stored-session', 'retry this question', [])
+  })
+
+  it('submits an isolated external intent without borrowing or changing the user draft', async () => {
+    const attachment: ComposerAttachment = { id: 'draft-file', kind: 'file', label: 'draft.txt' }
+
+    const { clearDraft, loadIntoComposer, onSubmit, stashAt } = renderSubmitHook({
+      attachments: [attachment],
+      text: 'unfinished user draft'
     })
 
-    await waitFor(() =>
-      expect(onSubmit).toHaveBeenCalledWith('ship the review changes', { composerScope: 'stored-session' })
+    await expect(
+      requestComposerSubmit('recovered question', {
+        expectedSession: { runtimeSessionId: 'runtime-session', storedSessionId: 'stored-session' },
+        preserveDraft: true,
+        requireIdle: true,
+        target: 'main'
+      })
+    ).resolves.toBe(true)
+
+    expect(onSubmit).toHaveBeenCalledWith('recovered question', {
+      attachments: [],
+      composerScope: 'stored-session'
+    })
+    expect(clearDraft).not.toHaveBeenCalled()
+    expect(loadIntoComposer).not.toHaveBeenCalled()
+    expect(stashAt).not.toHaveBeenCalled()
+  })
+
+  it('leaves the user draft untouched when an isolated submit rejects', async () => {
+    const { clearDraft, loadIntoComposer, onSubmit, stashAt } = renderSubmitHook({ text: 'keep me' })
+    onSubmit.mockResolvedValueOnce(false)
+
+    await expect(
+      requestComposerSubmit('recovered question', {
+        expectedSession: { runtimeSessionId: 'runtime-session', storedSessionId: 'stored-session' },
+        preserveDraft: true,
+        requireIdle: true,
+        target: 'main'
+      })
+    ).resolves.toBe(false)
+
+    expect(clearDraft).not.toHaveBeenCalled()
+    expect(loadIntoComposer).not.toHaveBeenCalled()
+    expect(stashAt).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    ['busy', { busy: true }],
+    ['queued', { queued: true }],
+    ['reconnecting or disabled', { disabled: true }]
+  ])('rejects an isolated submit while the addressed chat is %s', async (_label, options) => {
+    const { onSubmit } = renderSubmitHook(options)
+
+    await expect(
+      requestComposerSubmit('do not send', {
+        expectedSession: { runtimeSessionId: 'runtime-session', storedSessionId: 'stored-session' },
+        preserveDraft: true,
+        requireIdle: true,
+        target: 'main'
+      })
+    ).resolves.toBe(false)
+    expect(onSubmit).not.toHaveBeenCalled()
+  })
+
+  it('rechecks the exact session identity after the deferred event dispatch', async () => {
+    const { onSubmit } = renderSubmitHook()
+
+    await expect(
+      requestComposerSubmit('do not drift', {
+        expectedSession: { runtimeSessionId: 'another-runtime', storedSessionId: 'stored-session' },
+        preserveDraft: true,
+        requireIdle: true,
+        target: 'main'
+      })
+    ).resolves.toBe(false)
+    expect(onSubmit).not.toHaveBeenCalled()
+  })
+
+  it('waits for the claimed native submission instead of reporting an early failure', async () => {
+    let finishSubmit: ((accepted: boolean) => void) | undefined
+    const { onSubmit } = renderSubmitHook()
+    onSubmit.mockReturnValueOnce(
+      new Promise<boolean>(resolve => {
+        finishSubmit = resolve
+      })
     )
+
+    let settled = false
+
+    const submission = requestComposerSubmit('wait for admission', {
+      expectedSession: { runtimeSessionId: 'runtime-session', storedSessionId: 'stored-session' },
+      preserveDraft: true,
+      requireIdle: true,
+      target: 'main'
+    }).then(result => {
+      settled = true
+
+      return result
+    })
+
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(1))
+    expect(settled).toBe(false)
+
+    finishSubmit?.(true)
+    await expect(submission).resolves.toBe(true)
+  })
+
+  it('returns false when no composer claims the addressed target', async () => {
+    await expect(requestComposerSubmit('nowhere to send', { target: 'tile:missing' })).resolves.toBe(false)
   })
 })
 

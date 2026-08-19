@@ -129,7 +129,7 @@ export function ReviewShipBar() {
         <Button
           className="min-w-0 flex-1 justify-center px-7 text-[0.7rem] text-muted-foreground/85 hover:text-foreground"
           disabled={!hasFiles}
-          onClick={() => requestComposerSubmit(c.agentShipPrompt, { target: 'main' })}
+          onClick={() => void requestComposerSubmit(c.agentShipPrompt, { target: 'main' })}
           size="sm"
           variant="ghost"
         >

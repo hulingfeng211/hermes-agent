@@ -6,7 +6,6 @@ import { type ChatMessage, textPart } from '@/lib/chat-messages'
 import { optimisticAttachmentRef } from '@/lib/chat-runtime'
 import { sanitizeComposerInput } from '@/lib/composer-input-sanitize'
 import { setMutableRef } from '@/lib/mutable-ref'
-import { cloneTurnMetadata } from '@/lib/turn-metadata'
 import {
   isVoicePlaybackActive,
   markVoicePlaybackInterrupted,
@@ -45,7 +44,6 @@ import {
   isProviderSetupError,
   isSessionBusyError,
   isTargetSessionBusy,
-  oneShotComposerAdmission,
   releaseSubmitInFlight,
   SessionRecoveryAborted,
   type SubmitTextOptions,
@@ -119,8 +117,6 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
   return useCallback(
     async (rawText: string, options?: SubmitTextOptions) => {
       const visibleText = sanitizeComposerInput(rawText).trim()
-      const turnMetadata = cloneTurnMetadata(options?.turnMetadata)
-      const commitComposerAdmission = oneShotComposerAdmission(options?.commitComposerAdmission)
       const usingComposerAttachments = !options?.attachments
 
       // Drop undefined/null holes a session switch or draft restore can leave in
@@ -698,7 +694,6 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
         const submitParams = (targetId: string) => ({
           session_id: targetId,
           text,
-          ...(turnMetadata && { turn_metadata: turnMetadata }),
           ...(interrupted && { interrupted }),
           // Off-screen widget intent: the gateway types the persisted user
           // row display_kind=hidden so no client renders it as a bubble.
@@ -729,15 +724,9 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
             sessionId,
             recoverStoredSessionId,
             liveId =>
-              withSessionBusyRetry(() => {
-                // This is the new-turn admission boundary: every client-side
-                // guard has passed and the next operation is prompt.submit.
-                // The receipt is one-shot, so resume/busy retries cannot commit
-                // middleware state more than once.
-                commitComposerAdmission?.()
-
-                return requestGateway('prompt.submit', submitParams(liveId), PROMPT_SUBMIT_REQUEST_TIMEOUT_MS)
-              }),
+              withSessionBusyRetry(() =>
+                requestGateway('prompt.submit', submitParams(liveId), PROMPT_SUBMIT_REQUEST_TIMEOUT_MS)
+              ),
             {
               requestGateway,
               driftReason: sessionDriftReason,

@@ -1107,7 +1107,6 @@ describe('usePromptActions slash.exec dispatch payloads', () => {
   it('executes /approvals against the focused profile session and persists its mode', async () => {
     const focusedProfile = 'work'
     const focusedSessionId = 'work-runtime-session'
-    const commit = vi.fn()
     const persistedModes = new Map<string, string>()
     const sessionProfiles = new Map([[focusedSessionId, focusedProfile]])
 
@@ -1140,7 +1139,7 @@ describe('usePromptActions slash.exec dispatch payloads', () => {
       />
     )
 
-    await handle!.submitText('/approvals off', { commitComposerAdmission: commit })
+    await handle!.submitText('/approvals off')
 
     expect(requestGateway).toHaveBeenCalledWith('slash.exec', {
       command: 'approvals off',
@@ -1148,17 +1147,14 @@ describe('usePromptActions slash.exec dispatch payloads', () => {
     })
     expect(persistedModes.get(focusedProfile)).toBe('off')
     expect(persistedModes.has('default')).toBe(false)
-    expect(commit).not.toHaveBeenCalled()
   })
 
   it('submits /goal send directives returned directly by slash.exec instead of rendering no output', async () => {
     const calls: { method: string; params?: Record<string, unknown> }[] = []
-    const lifecycle: string[] = []
     const states: Record<string, unknown>[] = []
 
     const requestGateway = vi.fn(async (method: string, params?: Record<string, unknown>) => {
       calls.push({ method, params })
-      lifecycle.push(`rpc:${method}`)
 
       if (method === 'slash.exec') {
         return {
@@ -1181,13 +1177,9 @@ describe('usePromptActions slash.exec dispatch payloads', () => {
       />
     )
 
-    const commit = vi.fn(() => lifecycle.push('commit'))
-
-    await handle!.submitText('/goal write the implementation plan', { commitComposerAdmission: commit })
+    await handle!.submitText('/goal write the implementation plan')
 
     expect(calls.map(c => c.method)).toEqual(['slash.exec', 'prompt.submit'])
-    expect(lifecycle).toEqual(['rpc:slash.exec', 'commit', 'rpc:prompt.submit'])
-    expect(commit).toHaveBeenCalledTimes(1)
     expect(calls[0]?.params).toEqual({
       command: 'goal write the implementation plan',
       session_id: RUNTIME_SESSION_ID
@@ -1211,29 +1203,6 @@ describe('usePromptActions slash.exec dispatch payloads', () => {
     expect(renderedText).not.toContain('/goal: no output')
   })
 
-  it('does not commit a prefill slash directive that only restores a draft', async () => {
-    setComposerDraft('')
-    const commit = vi.fn()
-
-    const requestGateway = vi.fn(
-      async (method: string) =>
-        (method === 'slash.exec'
-          ? { type: 'prefill', notice: 'Backed up one turn.', message: 'edit this before sending' }
-          : {}) as never
-    )
-
-    let handle: HarnessHandle | null = null
-    await actRender(
-      <Harness onReady={h => (handle = h)} refreshSessions={async () => undefined} requestGateway={requestGateway} />
-    )
-
-    await handle!.submitText('/undo', { commitComposerAdmission: commit })
-
-    expect($composerDraft.get()).toBe('edit this before sending')
-    expect(requestGateway).not.toHaveBeenCalledWith('prompt.submit', expect.anything())
-    expect(commit).not.toHaveBeenCalled()
-  })
-
   it('queues the /goal kickoff instead of dropping it when the session is busy (#63352)', async () => {
     // The backend sets the goal the moment slash.exec runs — dropping the
     // returned kickoff message because busyRef was true left a goal the agent
@@ -1246,7 +1215,6 @@ describe('usePromptActions slash.exec dispatch payloads', () => {
     })
 
     const calls: { method: string; params?: Record<string, unknown> }[] = []
-    const commit = vi.fn()
     const states: Record<string, unknown>[] = []
     const busyRef = { current: true }
 
@@ -1275,18 +1243,13 @@ describe('usePromptActions slash.exec dispatch payloads', () => {
       />
     )
 
-    await handle!.submitText('/goal ship the release notes', {
-      commitComposerAdmission: commit,
-      composerPrepared: true
-    })
+    await handle!.submitText('/goal ship the release notes')
 
     // The kickoff must NOT submit mid-turn — and must NOT vanish either.
     expect(calls.map(c => c.method)).toEqual(['slash.exec'])
 
     const queued = getQueuedPrompts(RUNTIME_SESSION_ID)
     expect(queued.map(entry => entry.text)).toEqual(['ship the release notes'])
-    expect(queued[0]?.composerPrepared).toBe(true)
-    expect(commit).toHaveBeenCalledTimes(1)
 
     const renderedText = states
       .flatMap(state => {
@@ -1442,7 +1405,6 @@ describe('usePromptActions slash.exec dispatch payloads', () => {
     publishSessionState(tabRuntimeId, createClientSessionState(tabStoredId))
 
     const submitted: (Record<string, unknown> | undefined)[] = []
-    const commit = vi.fn()
 
     const requestGateway = vi.fn(async (method: string, params?: Record<string, unknown>) => {
       if (method === 'prompt.submit') {
@@ -1467,10 +1429,7 @@ describe('usePromptActions slash.exec dispatch payloads', () => {
       />
     )
 
-    await handle!.submitText('/work fix the tab bug', {
-      commitComposerAdmission: commit,
-      sessionId: tabRuntimeId
-    })
+    await handle!.submitText('/work fix the tab bug', { sessionId: tabRuntimeId })
 
     expect(submitted).toEqual([
       expect.objectContaining({
@@ -1478,7 +1437,6 @@ describe('usePromptActions slash.exec dispatch payloads', () => {
         text: 'Load the work skill, then: fix the tab bug'
       })
     ])
-    expect(commit).toHaveBeenCalledTimes(1)
 
     dropSessionState(tabRuntimeId)
     $queuedPromptsBySession.set({})
@@ -1629,7 +1587,6 @@ describe('usePromptActions slash.exec dispatch payloads', () => {
   it('restores a degenerate slash payload to the composer instead of losing it', async () => {
     setComposerDraft('')
 
-    const commit = vi.fn()
     const requestGateway = vi.fn(async () => ({}) as never)
 
     let handle: HarnessHandle | null = null
@@ -1640,11 +1597,10 @@ describe('usePromptActions slash.exec dispatch payloads', () => {
     // `/ text` parses to an empty command name on every surface (CLI parity).
     // The composer draft was already cleared on submit and slash input never
     // enters the Up-arrow history ring, so the payload must be handed back.
-    await handle!.submitText('/ pasted context that must not vanish', { commitComposerAdmission: commit })
+    await handle!.submitText('/ pasted context that must not vanish')
 
     expect($composerDraft.get()).toBe('/ pasted context that must not vanish')
     expect(requestGateway).not.toHaveBeenCalledWith('slash.exec', expect.anything())
-    expect(commit).not.toHaveBeenCalled()
   })
 })
 
@@ -1680,7 +1636,6 @@ describe('usePromptActions desktop slash pickers', () => {
   })
 
   it('opens the memory graph overlay for /journey and its aliases instead of hitting the backend', async () => {
-    const commit = vi.fn()
     const openMemoryGraph = vi.fn()
     const requestGateway = vi.fn(async () => ({}) as never)
 
@@ -1694,14 +1649,13 @@ describe('usePromptActions desktop slash pickers', () => {
       />
     )
 
-    await handle!.submitText('/journey', { commitComposerAdmission: commit })
-    await handle!.submitText('/memory-graph', { commitComposerAdmission: commit })
-    await handle!.submitText('/learning', { commitComposerAdmission: commit })
+    await handle!.submitText('/journey')
+    await handle!.submitText('/memory-graph')
+    await handle!.submitText('/learning')
 
     expect(openMemoryGraph).toHaveBeenCalledTimes(3)
     expect(requestGateway).not.toHaveBeenCalledWith('slash.exec', expect.anything())
     expect(requestGateway).not.toHaveBeenCalledWith('command.dispatch', expect.anything())
-    expect(commit).not.toHaveBeenCalled()
   })
 
   it('marks a timed-out handoff as failed so the next attempt can retry', async () => {
@@ -1773,62 +1727,6 @@ describe('usePromptActions submit / queue drain semantics', () => {
       },
       1_800_000
     )
-  })
-
-  it('forwards a detached turn metadata snapshot only on prompt.submit', async () => {
-    const calls: Array<{ method: string; params?: Record<string, unknown>; timeoutMs?: number }> = []
-    const lifecycle: string[] = []
-
-    const requestGateway = vi.fn(async (method: string, params?: Record<string, unknown>, timeoutMs?: number) => {
-      calls.push({ method, params, timeoutMs })
-      lifecycle.push(method)
-
-      return {} as never
-    })
-
-    const turnMetadata = { 'acme.review': { mode: 'strict' } }
-    const commit = vi.fn(() => lifecycle.push('commit'))
-
-    let handle: HarnessHandle | null = null
-    await actRender(
-      <Harness onReady={h => (handle = h)} refreshSessions={async () => undefined} requestGateway={requestGateway} />
-    )
-
-    await handle!.submitText('review this turn', { commitComposerAdmission: commit, turnMetadata })
-
-    const submitCall = calls.find(call => call.method === 'prompt.submit')
-    expect(submitCall).toEqual({
-      method: 'prompt.submit',
-      params: {
-        session_id: RUNTIME_SESSION_ID,
-        text: 'review this turn',
-        turn_metadata: { 'acme.review': { mode: 'strict' } }
-      },
-      timeoutMs: 1_800_000
-    })
-    expect((submitCall?.params as { turn_metadata: unknown }).turn_metadata).not.toBe(turnMetadata)
-    expect(lifecycle).toEqual(['commit', 'prompt.submit'])
-    expect(commit).toHaveBeenCalledTimes(1)
-  })
-
-  it('finalizes the admission receipt once when prompt.submit reaches a rejecting host', async () => {
-    const commit = vi.fn()
-
-    const requestGateway = vi.fn(async (method: string) => {
-      if (method === 'prompt.submit') {
-        throw new Error('host rejected the turn')
-      }
-
-      return {} as never
-    })
-
-    let handle: HarnessHandle | null = null
-    await actRender(
-      <Harness onReady={h => (handle = h)} refreshSessions={async () => undefined} requestGateway={requestGateway} />
-    )
-
-    expect(await handle!.submitText('consume one-shot intent', { commitComposerAdmission: commit })).toBe(false)
-    expect(commit).toHaveBeenCalledTimes(1)
   })
 
   it('arms turnStartedAt at submit time instead of waiting for message.start', async () => {
@@ -2234,7 +2132,6 @@ describe('usePromptActions submit / queue drain semantics', () => {
     // has fully wound down. It must be invisible: retried in place until the
     // gateway accepts, never a red "session busy" bubble.
     let attempt = 0
-    const commit = vi.fn()
     const seeds: Record<string, unknown>[] = []
 
     const requestGateway = vi.fn(async (method: string) => {
@@ -2259,9 +2156,8 @@ describe('usePromptActions submit / queue drain semantics', () => {
       />
     )
 
-    expect(await handle!.submitText('sent while settling', { commitComposerAdmission: commit })).toBe(true)
+    expect(await handle!.submitText('sent while settling')).toBe(true)
     expect(attempt).toBe(2) // rode past the busy on the second try
-    expect(commit).toHaveBeenCalledTimes(1)
     // No assistant-error message was appended for the transient busy.
     expect(seeds.some(s => Array.isArray(s.messages) && (s.messages as { error?: string }[]).some(m => m.error))).toBe(
       false
@@ -3265,7 +3161,6 @@ describe('usePromptActions sleep/wake session recovery', () => {
     // durable stored id (which survives gateway restarts), gets a fresh live id,
     // and retries the send transparently.
     const calls: { method: string; params?: Record<string, unknown> }[] = []
-    const commit = vi.fn()
     let submitAttempts = 0
 
     const requestGateway = vi.fn(async (method: string, params?: Record<string, unknown>) => {
@@ -3298,14 +3193,13 @@ describe('usePromptActions sleep/wake session recovery', () => {
       />
     )
 
-    const ok = await handle!.submitText('message after wake', { commitComposerAdmission: commit })
+    const ok = await handle!.submitText('message after wake')
 
     expect(ok).toBe(true)
     // First submit (stale id) → session.resume (stored id) → retry submit (fresh id).
     expect(calls.map(c => c.method)).toEqual(['prompt.submit', 'session.resume', 'prompt.submit'])
     expect(calls[1]?.params).toEqual({ session_id: STORED_SESSION_ID, source: 'desktop', omit_messages: true })
     expect(calls[2]?.params).toEqual({ session_id: RECOVERED_SESSION_ID, text: 'message after wake' })
-    expect(commit).toHaveBeenCalledTimes(1)
   })
 
   it('resumes the stored session and retries once when reloadFromMessage (regenerate) reports "session not found"', async () => {

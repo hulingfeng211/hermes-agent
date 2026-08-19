@@ -52,44 +52,6 @@ def test_enqueue_preserves_order_after_an_image_turn():
     ]
 
 
-def test_enqueue_keeps_distinct_turn_metadata_in_separate_envelopes():
-    session = _session()
-    bypass = {"acme.review": {"mode": "skip"}}
-    grounded = {"acme.review": {"mode": "strict"}}
-
-    server._enqueue_prompt(session, "B", "ws-1", turn_metadata=bypass)
-    server._enqueue_prompt(session, "C", "ws-1", turn_metadata=grounded)
-
-    bypass["acme.review"]["mode"] = "mutated-after-enqueue"
-    assert session["queued_prompt"] == {
-        "text": "B",
-        "transport": "ws-1",
-        "turn_metadata": {"acme.review": {"mode": "skip"}},
-    }
-    assert session["queued_prompts"] == [
-        {
-            "text": "C",
-            "transport": "ws-1",
-            "turn_metadata": {"acme.review": {"mode": "strict"}},
-        }
-    ]
-
-
-def test_enqueue_merges_text_only_prompts_with_identical_turn_metadata():
-    session = _session()
-    metadata = {"acme.review": {"mode": "skip"}}
-
-    server._enqueue_prompt(session, "B", "ws-1", turn_metadata=metadata)
-    server._enqueue_prompt(session, "C", "ws-2", turn_metadata=metadata)
-
-    assert session["queued_prompt"] == {
-        "text": "B\n\nC",
-        "transport": "ws-1",
-        "turn_metadata": metadata,
-    }
-    assert session.get("queued_prompts") is None
-
-
 
 
 # ── _handle_busy_submit (policy) ───────────────────────────────────────────
@@ -115,31 +77,6 @@ def test_busy_interrupt_mode_redirects_active_turn(monkeypatch):
     assert session["inflight_turn"]["user"] == "original request"
     assert session["inflight_turn"]["corrections"] == ["redirect"]
     assert session.get("queued_prompt") is None
-
-
-def test_busy_submit_with_turn_metadata_cannot_redirect_active_turn(monkeypatch):
-    monkeypatch.setattr(server, "_load_busy_input_mode", lambda: "interrupt")
-    calls = {"redirect": 0, "interrupt": 0}
-    agent = types.SimpleNamespace(
-        _supports_active_turn_redirect=True,
-        redirect=lambda _text: calls.__setitem__("redirect", calls["redirect"] + 1),
-        interrupt=lambda: calls.__setitem__("interrupt", calls["interrupt"] + 1),
-    )
-    session = _session(agent=agent, running=True)
-    metadata = {"acme.review": {"mode": "skip"}}
-
-    response = server._handle_busy_submit(
-        "r1",
-        "sid",
-        session,
-        "run separately",
-        "ws-1",
-        turn_metadata=metadata,
-    )
-
-    assert response["result"]["status"] == "queued"
-    assert calls == {"redirect": 0, "interrupt": 1}
-    assert session["queued_prompt"]["turn_metadata"] == metadata
 
 
 def test_successful_redirect_drops_queued_duplicate_of_inflight_user(monkeypatch):
@@ -717,118 +654,6 @@ def test_drain_compute_host_forwards_queued_image_paths(monkeypatch):
         "text": "inspect",
         "image_paths": ["/tmp/b.png"],
     }
-
-
-def test_drain_forwards_turn_metadata_to_the_claimed_turn(monkeypatch):
-    captured = {}
-    monkeypatch.setattr(server, "_session_uses_compute_host", lambda _session: False)
-    monkeypatch.setattr(
-        server,
-        "_run_prompt_submit",
-        lambda rid, sid, session, text, **kwargs: captured.update(
-            rid=rid,
-            sid=sid,
-            text=text,
-            turn_metadata=kwargs.get("turn_metadata"),
-        ),
-    )
-    metadata = {"acme.review": {"mode": "skip"}}
-    session = _session(
-        queued_prompt={
-            "text": "next",
-            "transport": "ws-9",
-            "turn_metadata": metadata,
-        }
-    )
-
-    assert server._drain_queued_prompt("r1", "sid", session) is True
-    assert captured == {
-        "rid": "r1",
-        "sid": "sid",
-        "text": "next",
-        "turn_metadata": metadata,
-    }
-
-
-def test_prompt_submit_rejects_invalid_turn_metadata_before_session_claim(monkeypatch):
-    monkeypatch.setattr(
-        server,
-        "_sess_nowait",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            AssertionError("invalid metadata must be rejected before session lookup")
-        ),
-    )
-
-    response = server._methods["prompt.submit"](
-        "r1",
-        {
-            "session_id": "sid",
-            "text": "hello",
-            "turn_metadata": {"Bad Namespace": {}},
-        },
-    )
-
-    assert response["error"]["code"] == 4004
-    assert "namespace" in response["error"]["message"]
-
-
-def test_prompt_submit_forwards_valid_metadata_without_persisting_it(monkeypatch):
-    captured = {}
-
-    class _ImmediateThread:
-        def __init__(self, target=None, **_kwargs):
-            self.target = target
-
-        def start(self):
-            if self.target is not None:
-                self.target()
-
-        def is_alive(self):
-            return False
-
-    session = _session(agent=types.SimpleNamespace(), running=False)
-    server._sessions["metadata-sid"] = session
-    monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
-    monkeypatch.setattr(server, "_ensure_active_session_slot", lambda *_args: None)
-    monkeypatch.setattr(server, "_session_uses_compute_host", lambda *_args: False)
-    monkeypatch.setattr(server, "_ensure_session_db_row", lambda *_args: None)
-    monkeypatch.setattr(server, "_persist_branch_seed", lambda *_args: None)
-    monkeypatch.setattr(server, "_start_agent_build", lambda *_args: None)
-    monkeypatch.setattr(
-        server,
-        "_run_prompt_submit",
-        lambda rid, sid, received_session, text, **kwargs: captured.update(
-            rid=rid,
-            sid=sid,
-            session=received_session,
-            text=text,
-            turn_metadata=kwargs.get("turn_metadata"),
-        ),
-    )
-    try:
-        response = server._methods["prompt.submit"](
-            "r1",
-            {
-                "session_id": "metadata-sid",
-                "text": "review this",
-                "turn_metadata": {"acme.review": {"mode": "strict"}},
-            },
-        )
-    finally:
-        server._sessions.pop("metadata-sid", None)
-
-    assert response["result"]["status"] == "streaming"
-    assert captured == {
-        "rid": "r1",
-        "sid": "metadata-sid",
-        "session": session,
-        "text": "review this",
-        "turn_metadata": {"acme.review": {"mode": "strict"}},
-    }
-    assert "turn_metadata" not in session
-    assert session["history"] == []
-    assert session["inflight_turn"]["user"] == "review this"
-    assert "turn_metadata" not in session["inflight_turn"]
 
 
 

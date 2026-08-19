@@ -17,8 +17,7 @@
  * Core keeps ownership of the transcript, input, and submit engine — these
  * seams AUGMENT the composer, they never replace it. Middleware runs as an
  * ordered async chain around the app's onSubmit: each handler may rewrite the
- * draft, pass it through, cancel the send by returning null, or declare work
- * that runs only after the draft is admitted as a real new turn.
+ * draft, pass it through, or cancel the send by returning null.
  */
 
 import { createContext, useContext, useMemo } from 'react'
@@ -26,7 +25,6 @@ import { createContext, useContext, useMemo } from 'react'
 import { useContributions } from '@/contrib/react/use-contributions'
 import { registry } from '@/contrib/registry'
 import type { TodoItem } from '@/lib/todos'
-import { cloneTurnMetadata, type TurnMetadata } from '@/lib/turn-metadata'
 import type { ComposerAttachment } from '@/store/composer'
 import type { ComposerAction } from '@/store/composer-actions'
 
@@ -45,8 +43,6 @@ export const COMPOSER_AREAS = {
 export interface ComposerDraft {
   text: string
   attachments?: ComposerAttachment[]
-  /** Namespaced, JSON-safe data bound to this one new turn. */
-  turnMetadata?: TurnMetadata
 }
 
 /** Identity of the ChatBar that owns a render or submit. `storedSessionId`
@@ -71,29 +67,9 @@ export const ComposerContextProvider = ComposerContext.Provider
 export const useComposerContext = (): ComposerContextValue => useContext(ComposerContext)
 
 /** Payload of a `composer.middleware` data contribution. */
-export interface ComposerMiddlewareResult {
-  /** The transformed draft to pass to the rest of the middleware chain. */
-  draft: ComposerDraft
-  /** Runs once, and only once, when this operation is admitted as a new model
-   * turn. It is not called for steering, cancellation, or non-model commands. */
-  onCommit?: () => void
-}
-
-export interface PreparedComposerDraft {
-  draft: ComposerDraft
-  /** One-shot aggregate of the middleware callbacks that requested commit. */
-  commit?: () => void
-}
-
-export type ComposerMiddlewareOutput = ComposerDraft | ComposerMiddlewareResult | null
-
 export interface ComposerMiddleware {
-  /** Rewrite/pass through with a draft, cancel with null, or return
-   * `{ draft, onCommit }` to defer a side effect until new-turn admission. */
-  handler: (
-    draft: ComposerDraft,
-    context: ComposerContextValue
-  ) => ComposerMiddlewareOutput | Promise<ComposerMiddlewareOutput>
+  /** Rewrite (return a draft), pass through (same draft), or cancel (null). */
+  handler: (draft: ComposerDraft, context: ComposerContextValue) => ComposerDraft | null | Promise<ComposerDraft | null>
 }
 
 /** One row a `composer.atCompletions` source offers for the current query. */
@@ -139,10 +115,8 @@ export interface ComposerAttachmentProvider {
 export async function runComposerMiddleware(
   draft: ComposerDraft,
   context: ComposerContextValue = EMPTY_COMPOSER_CONTEXT
-): Promise<PreparedComposerDraft | null> {
-  const initialMetadata = cloneTurnMetadata(draft.turnMetadata)
-  let current: ComposerDraft = initialMetadata ? { ...draft, turnMetadata: initialMetadata } : draft
-  const commitCallbacks: Array<() => void> = []
+): Promise<ComposerDraft | null> {
+  let current = draft
 
   // Runtime plugins receive one immutable identity snapshot for the chain.
   // In particular, a tile/background session must never fall back to the
@@ -160,81 +134,19 @@ export async function runComposerMiddleware(
     }
 
     try {
-      // Give each runtime contribution a detached metadata snapshot. A handler
-      // that mutates its argument and then throws must still be pass-through;
-      // otherwise it could smuggle an unvalidated value into the next handler.
-      const middlewareDraft = {
-        ...current,
-        turnMetadata: cloneTurnMetadata(current.turnMetadata)
-      }
+      const next = await middleware.handler(current, middlewareContext)
 
-      const output = await middleware.handler(middlewareDraft, middlewareContext)
-
-      if (output === null) {
+      if (next === null) {
         return null
       }
 
-      const declaredResult = !('text' in output) && 'draft' in output
-      const next = declaredResult ? output.draft : output
-
-      if (declaredResult && output.onCommit !== undefined && typeof output.onCommit !== 'function') {
-        throw new TypeError('composer middleware onCommit must be a function')
-      }
-
-      // Runtime plugins are outside TypeScript's trust boundary. Validate and
-      // detach their metadata at every step; an invalid result is handled by
-      // the catch below exactly like a throwing middleware (pass-through).
-      current = { ...next, turnMetadata: cloneTurnMetadata(next.turnMetadata) }
-
-      if (declaredResult && output.onCommit) {
-        commitCallbacks.push(output.onCommit)
-      }
+      current = next
     } catch {
       // Pass-through: a faulty middleware must never swallow the message.
     }
   }
 
-  if (commitCallbacks.length === 0) {
-    return { draft: current }
-  }
-
-  let committed = false
-
-  const commit = () => {
-    if (committed) {
-      return
-    }
-
-    committed = true
-
-    for (const callback of commitCallbacks) {
-      try {
-        callback()
-      } catch {
-        // Admission is authoritative. A broken plugin callback cannot undo it
-        // or prevent later callbacks from observing the same committed turn.
-      }
-    }
-  }
-
-  return { draft: current, commit }
-}
-
-/**
- * Prepare a draft at the composer boundary. Queued entries set `prepared` when
- * middleware already ran at admission; draining validates and clones that
- * snapshot without consulting today's live contribution state again.
- */
-export async function prepareComposerDraft(
-  draft: ComposerDraft,
-  prepared = false,
-  context: ComposerContextValue = EMPTY_COMPOSER_CONTEXT
-): Promise<PreparedComposerDraft | null> {
-  if (!prepared) {
-    return runComposerMiddleware(draft, context)
-  }
-
-  return { draft: { ...draft, turnMetadata: cloneTurnMetadata(draft.turnMetadata) } }
+  return current
 }
 
 /** Attach-menu entries contributed by plugins/core, with stable render keys. */

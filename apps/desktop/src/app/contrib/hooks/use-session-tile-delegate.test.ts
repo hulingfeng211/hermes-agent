@@ -33,30 +33,26 @@ const row = (over: Partial<SessionInfo>): SessionInfo =>
     ...over
   }) as SessionInfo
 
-interface RenderTileOptions {
-  executeSlashCommand?: ReturnType<typeof vi.fn>
-  runtimeIdByStoredSessionIdRef?: { current: Map<string, string> }
-  sessionStateByRuntimeIdRef?: { current: Map<string, unknown> }
-  updateSessionState?: ReturnType<typeof vi.fn>
-}
-
-function renderTile(requestGateway: ReturnType<typeof vi.fn>, options: RenderTileOptions = {}) {
-  const executeSlashCommand = options.executeSlashCommand ?? vi.fn(async () => undefined)
-
+function renderTile(
+  requestGateway: ReturnType<typeof vi.fn>,
+  refs?: {
+    runtimeIdByStoredSessionIdRef?: { current: Map<string, string> }
+    sessionStateByRuntimeIdRef?: { current: Map<string, unknown> }
+    updateSessionState?: ReturnType<typeof vi.fn>
+  }
+) {
   renderHook(() =>
     useSessionTileDelegate({
       archiveSession: vi.fn(async () => undefined),
       branchStoredSession: vi.fn(async () => undefined),
-      executeSlashCommand: executeSlashCommand as never,
+      executeSlashCommand: vi.fn(async () => undefined) as never,
       removeSession: vi.fn(async () => undefined),
       requestGateway: requestGateway as never,
-      runtimeIdByStoredSessionIdRef: (options.runtimeIdByStoredSessionIdRef ?? { current: new Map() }) as never,
-      sessionStateByRuntimeIdRef: (options.sessionStateByRuntimeIdRef ?? { current: new Map() }) as never,
-      updateSessionState: (options.updateSessionState ?? vi.fn()) as never
+      runtimeIdByStoredSessionIdRef: (refs?.runtimeIdByStoredSessionIdRef ?? { current: new Map() }) as never,
+      sessionStateByRuntimeIdRef: (refs?.sessionStateByRuntimeIdRef ?? { current: new Map() }) as never,
+      updateSessionState: (refs?.updateSessionState ?? vi.fn()) as never
     })
   )
-
-  return { executeSlashCommand }
 }
 
 describe('useSessionTileDelegate resumeTile', () => {
@@ -111,29 +107,6 @@ describe('useSessionTileDelegate resumeTile', () => {
     })
   })
 
-  it('forwards a prepared admission receipt through a tile slash dispatch', async () => {
-    const executeSlashCommand = vi.fn(async () => undefined)
-    const commitComposerAdmission = vi.fn()
-    const turnMetadata = { 'acme.review': { mode: 'strict' } }
-
-    renderTile(
-      vi.fn(async () => ({}) as never),
-      { executeSlashCommand }
-    )
-
-    await sessionTileDelegate()!.executeSlash('/goal audit this tile', 'runtime-tile', {
-      commitComposerAdmission,
-      composerPrepared: true,
-      turnMetadata
-    })
-
-    expect(executeSlashCommand).toHaveBeenCalledWith('/goal audit this tile', {
-      commitComposerAdmission,
-      composerPrepared: true,
-      sessionId: 'runtime-tile',
-      turnMetadata
-    })
-  })
   it('reuses a warm binding that still carries a transcript', async () => {
     const stateA = { busy: false, messages: [{ id: 'm1' }], storedSessionId: 'stored-a' }
     const runtimeIdByStoredSessionIdRef = { current: new Map([['stored-a', 'runtime-a']]) }

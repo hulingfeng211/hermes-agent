@@ -270,7 +270,11 @@ describe('SkillsView toolset management', () => {
     const { notify } = await import('@/store/notifications')
     const { EmbeddedHubPicker } = await import('./embedded-hub-picker')
 
-    render(<EmbeddedHubPicker installedNames={new Set(['web-research'])} profile={null} />)
+    render(
+      <QueryClientProvider client={queryClient}>
+        <EmbeddedHubPicker installedNames={new Set(['web-research'])} profile={null} />
+      </QueryClientProvider>
+    )
 
     // The picker is expanded by default — the hub iframe is live on mount.
     expect(document.querySelector('iframe')).toBeTruthy()

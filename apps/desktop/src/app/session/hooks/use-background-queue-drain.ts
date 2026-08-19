@@ -121,8 +121,6 @@ export function useBackgroundQueueDrain({
           const accepted = await Promise.resolve(
             submitTextRef.current(liveEntry.text, {
               attachments: liveEntry.attachments,
-              ...(liveEntry.turnMetadata ? { turnMetadata: liveEntry.turnMetadata } : {}),
-              ...(liveEntry.composerPrepared ? { composerPrepared: true } : {}),
               fromQueue: true,
               sessionId: runtimeSessionId,
               storedSessionId: sessionKey
