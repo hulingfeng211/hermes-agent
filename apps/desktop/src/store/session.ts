@@ -5,8 +5,12 @@ import { lastVisibleMessageIsUser } from '@/app/chat/thread-loading'
 import type { ContextSuggestion } from '@/app/types'
 import type { HermesConnection } from '@/global'
 import type { ChatMessage } from '@/lib/chat-messages'
+import { activeConnectionScopeSuffix, rescopeConnectionScopedStores } from '@/lib/connection-scoped'
 import { persistBoolean, persistString, storedBoolean, storedString } from '@/lib/storage'
+import { syncCronModelImpactConnection } from '@/store/cron-model-impact-scope'
 import type { SessionInfo, UsageStats } from '@/types/hermes'
+
+import { clearUnreadOnOpen } from './session-unread-remote'
 
 type Updater<T> = T | ((current: T) => T)
 export type ComposerModelSource = '' | 'default' | 'manual'
@@ -39,7 +43,12 @@ const LAST_ROUTE_KEY = 'hermes.desktop.lastRoute'
 function profileNavigationKey(base: string, profile: string): string {
   const key = profile.trim() || 'default'
 
-  return `${base}.profile.${encodeURIComponent(key)}`
+  // Also carries the CONNECTION scope: the same profile name on a different
+  // gateway is a different backend with its own sessions, and windows on
+  // different gateways share this localStorage area — restoring one
+  // gateway's remembered session under another navigates to a session that
+  // backend has never seen (#77318).
+  return `${base}.profile.${encodeURIComponent(key)}${activeConnectionScopeSuffix()}`
 }
 
 // Discard legacy global keys once per tick. A module-level flag avoids
@@ -197,9 +206,12 @@ export async function ensureDefaultWorkspaceCwd(): Promise<void> {
   await syncConfiguredDefaultProjectDir()
   const configured = getConfiguredDefaultProjectDir()
 
+  // Transient: each source below is already remembered or comes from config, so
+  // persisting would only promote a configured default into the per-backend
+  // memory of what the user picked.
   const seedLiveCwd = (cwd: string) => {
     if (cwd && !$activeSessionId.get()) {
-      setCurrentCwd(cwd)
+      setCurrentCwdTransient(cwd)
     }
   }
 
@@ -250,6 +262,62 @@ export const sessionMatchesStoredId = (
   session: Pick<SessionInfo, '_lineage_root_id' | 'id'>,
   storedSessionId: string
 ): boolean => session.id === storedSessionId || session._lineage_root_id === storedSessionId
+
+// Alias lookup, memoized per sessions-list reference. `lineageAliases` runs
+// per cached session state per status projection per message delta — an
+// O(sessions) scan there multiplies out to states × sessions × ~30Hz per busy
+// session, which is what made a populated recents list drag every stream. The
+// list is replaced wholesale (never mutated), so its reference is the cache key.
+type LineageRow = Pick<SessionInfo, '_lineage_root_id' | 'id'>
+const lineageIndexBySessions = new WeakMap<readonly LineageRow[], Map<string, string[]>>()
+
+function lineageIndex(sessions: readonly LineageRow[]): Map<string, string[]> {
+  const cached = lineageIndexBySessions.get(sessions)
+
+  if (cached) {
+    return cached
+  }
+
+  const index = new Map<string, string[]>()
+
+  const add = (key: string, value: string) => {
+    const bucket = index.get(key)
+
+    if (!bucket) {
+      index.set(key, [value])
+    } else if (!bucket.includes(value)) {
+      bucket.push(value)
+    }
+  }
+
+  for (const session of sessions) {
+    add(session.id, session.id)
+
+    if (session._lineage_root_id) {
+      add(session.id, session._lineage_root_id)
+      add(session._lineage_root_id, session.id)
+      add(session._lineage_root_id, session._lineage_root_id)
+    }
+  }
+
+  lineageIndexBySessions.set(sessions, index)
+
+  return index
+}
+
+/** Every id one conversation answers to: the id we were handed, plus the live
+ *  id and lineage root of each session it resolves to.
+ *
+ *  Status sets are published under a session's CURRENT stored id, but a sidebar
+ *  row, a persisted tile, and the route can each hold a different tip of the
+ *  same lineage after a compression. Publishing every alias lets those surfaces
+ *  keep using a plain membership test instead of each re-deriving lineage —
+ *  and getting it wrong, which reads as a running session going idle mid-turn. */
+export function lineageAliases(storedId: string, sessions: readonly LineageRow[]): string[] {
+  // Every key is in its own bucket by construction, so the bucket IS the
+  // alias set. Copied so no caller can mutate the shared index.
+  return lineageIndex(sessions).get(storedId)?.slice() ?? [storedId]
+}
 
 /** True when two ids name the same conversation across compression tip rotation. */
 export function idsShareLineage(
@@ -377,7 +445,41 @@ export function mergeSessionPage(
       (keep.has(session.id) || (session._lineage_root_id != null && keep.has(session._lineage_root_id)))
   )
 
-  return survivors.length ? [...survivors, ...merged] : merged
+  if (!survivors.length) {
+    return merged
+  }
+
+  // Survivors carry their old relative positions from `previous`, which can be
+  // stale — the server page is the fresh `order=recent` truth. Sort survivors
+  // by the same effective-recency key the backend sorts by (last_active with a
+  // started_at fallback) and interleave them into the title-preserving merged
+  // rows so a retained session lands where recency puts it instead of the
+  // whole set forming a stale block at the top of the sidebar (fixes #47203).
+  // Ties keep the survivor first, matching the old prepend behavior.
+  const recency = (session: SessionInfo): number => Math.max(session.last_active || 0, session.started_at || 0)
+
+  const sortedSurvivors = [...survivors].sort((a, b) => recency(b) - recency(a))
+  const interleaved: SessionInfo[] = []
+  let survivorIndex = 0
+  let mergedIndex = 0
+
+  while (survivorIndex < sortedSurvivors.length && mergedIndex < merged.length) {
+    if (recency(sortedSurvivors[survivorIndex]) >= recency(merged[mergedIndex])) {
+      interleaved.push(sortedSurvivors[survivorIndex++])
+    } else {
+      interleaved.push(merged[mergedIndex++])
+    }
+  }
+
+  while (survivorIndex < sortedSurvivors.length) {
+    interleaved.push(sortedSurvivors[survivorIndex++])
+  }
+
+  while (mergedIndex < merged.length) {
+    interleaved.push(merged[mergedIndex++])
+  }
+
+  return interleaved
 }
 
 /** Raise a session in recents on user send (before stream / turn resolve). */
@@ -450,6 +552,16 @@ export const $messagingTruncated = atom<boolean>(false)
 // "is there another page?" is what pagination actually needs and comes free
 // from the row count the query already returned.
 export const $sessionProfilesTruncated = atom<Record<string, boolean>>({})
+
+/** Tokens and spend per profile across ALL its sessions, not just the loaded
+ *  page — summed in SQL so a profile group's header total doesn't move when the
+ *  window does. Keyed by profile name. */
+export interface ProfileUsage {
+  cost_usd: number
+  tokens: number
+}
+
+export const $sessionProfilesUsage = atom<Record<string, ProfileUsage>>({})
 export const $sessionsLoading = atom(true)
 export const $activeSessionId = atom<string | null>(null)
 export const $selectedStoredSessionId = atom<string | null>(null)
@@ -486,6 +598,12 @@ export const $awaitingResponse = atom(false)
 // resume on the next render/focus/reconnect instead of stranding the window.
 // Null whenever the active route has a healthy (or in-flight) resume.
 export const $resumeFailedSessionId = atom<string | null>(null)
+export interface SessionResumeRequest {
+  sequence: number
+  sessionId: string
+}
+let sessionResumeRequestSequence = 0
+export const $sessionResumeRequest = atom<SessionResumeRequest | null>(null)
 // Stored-session id whose resume has EXHAUSTED its bounded auto-retries (the
 // terminal-failure latch above kept failing through all MAX_RESUME_RETRIES
 // attempts). Distinct from $resumeFailedSessionId, which is armed *during* the
@@ -527,6 +645,12 @@ export const $currentCwd = atom(getRememberedWorkspaceCwd())
 // would collapse the workspace panes and drop file-tree state on every switch,
 // so the path stays put and is simply marked as not-yet-owned.
 export const $workspaceCwdOwner = atom<null | string>(null)
+
+// Terminal execution backend (local | docker | ssh | ...) mirrored from the
+// gateway (session.info). Drives attachment upload decisions: container
+// backends have their own filesystem, so a dropped host path must be uploaded
+// as bytes and staged into a bind-mounted cache dir (#76577).
+export const $terminalBackend = atom('')
 export const $newChatWorkspaceTarget = atom<NewChatWorkspaceTarget>(undefined)
 export const $newChatWorkspaceTargetGeneration = atom(0)
 export const $currentBranch = atom('')
@@ -546,7 +670,16 @@ export const $contextSuggestions = atom<ContextSuggestion[]>([])
 export const $modelPickerOpen = atom(false)
 export const $sessionPickerOpen = atom(false)
 
-export const setConnection = (next: Updater<HermesConnection | null>) => updateAtom($connection, next)
+export const setConnection = (next: Updater<HermesConnection | null>) => {
+  updateAtom($connection, next)
+  // Repoint connection-scoped persistence (pins, manual session order,
+  // remembered navigation) at the new backend's storage scope before any
+  // consumer reconciles against it. A null descriptor (reconnect blip)
+  // keeps the current scope.
+  rescopeConnectionScopedStores($connection.get())
+  syncCronModelImpactConnection($connection.get())
+}
+
 export const setGatewayState = (next: Updater<ConnectionState>) => updateAtom($gatewayState, next)
 export const setSessions = (next: Updater<SessionInfo[]>) => updateAtom($sessions, next)
 export const setCronSessions = (next: Updater<SessionInfo[]>) => updateAtom($cronSessions, next)
@@ -556,28 +689,105 @@ export const setMessagingPlatformTotals = (next: Updater<Record<string, number>>
 export const setMessagingTruncated = (next: Updater<boolean>) => updateAtom($messagingTruncated, next)
 export const setSessionProfilesTruncated = (next: Updater<Record<string, boolean>>) =>
   updateAtom($sessionProfilesTruncated, next)
+export const setSessionProfilesUsage = (next: Updater<Record<string, ProfileUsage>>) =>
+  updateAtom($sessionProfilesUsage, next)
 export const setSessionsLoading = (next: Updater<boolean>) => updateAtom($sessionsLoading, next)
 export const setActiveSessionId = (next: Updater<string | null>) => updateAtom($activeSessionId, next)
 export const setActiveSessionStoredIdRotation = (next: Updater<ActiveSessionStoredIdRotation | null>) =>
   updateAtom($activeSessionStoredIdRotation, next)
 
-// Transient: a background session finished and the user hasn't opened it since.
-// Written by session-states.ts (handleTransition), cleared here on session open.
+// A background session finished and the user hasn't opened it since. This atom
+// is the transient PAINT layer (what the dots subscribe to); durability lives
+// in session-unread.ts, which persists explicit finish markers + per-session
+// "seen message_count" watermarks and rebuilds this atom from them on every
+// list refresh — so the green dot survives an app restart, and a session that
+// finished while the app was CLOSED still comes up unread. The explicit
+// Mark-as-unread toggle rides the BACKEND watermark instead
+// (SessionDB.set_session_read, session-unread-remote.ts). Written by
+// session-states.ts (live busy→idle edge), cleared here on session open.
 export const $unreadFinishedSessionIds = atom<string[]>([])
+
+/** Sidebar "mark all as read" — clears every finished-unread dot. Purely
+ *  renderer-local, like the atom itself. */
+export function markAllSessionsRead() {
+  if ($unreadFinishedSessionIds.get().length > 0) {
+    $unreadFinishedSessionIds.set([])
+  }
+}
+
+// Last time the user actually viewed a session. A finished turn should only
+// re-arm the unread marker if it settles AFTER this baseline; otherwise an
+// already-viewed completion keeps re-lighting the row.
+export const $lastReadAtBySessionId = atom<Record<string, number>>({})
+
+/** A new turn started for this session: the read baseline only guarded the
+ *  PREVIOUS completion's re-asserts, so drop it — the new turn's finish must
+ *  re-light even when it lands in the same millisecond as the last read. */
+export const clearReadBaseline = (storedSessionId: string) => {
+  const map = $lastReadAtBySessionId.get()
+
+  if (storedSessionId in map) {
+    const { [storedSessionId]: _dropped, ...rest } = map
+    $lastReadAtBySessionId.set(rest)
+  }
+}
 
 export const setSelectedStoredSessionId = (next: Updater<string | null>) => {
   updateAtom($selectedStoredSessionId, next)
   // Opening a session clears its unread state — the user is now looking at it.
+  // Clear the whole conversation family (branch children + compression lineage
+  // root), not just the exact row: the sidebar lights the dot for every alias
+  // of a lineage, so reading any row must clear all of them.
   const id = $selectedStoredSessionId.get()
 
-  if (id && $unreadFinishedSessionIds.get().includes(id)) {
-    $unreadFinishedSessionIds.set($unreadFinishedSessionIds.get().filter(x => x !== id))
+  if (id) {
+    markSessionRead(id)
   }
+
+  // ...and the persisted watermark flag, when the row carried one.
+  if (id) {
+    void clearUnreadOnOpen(id)
+  }
+}
+
+/** Record that the user has seen a session (and its conversation family) at
+ *  this moment. Clears the unread set for the family and stores a last-read
+ *  baseline so a later completion that settles BEFORE this view is not
+ *  re-lit. Must be callable before any focus short-circuit (openSession top)
+ *  so re-clicking an already-visible session still clears its dot. */
+export const markSessionRead = (storedSessionId: string | null | undefined) => {
+  if (!storedSessionId) {
+    return
+  }
+
+  const sessions = $sessions.get()
+  const familyIds = new Set<string>(lineageAliases(storedSessionId, sessions))
+
+  const lastReadAt = Date.now()
+  const nextReadMap = { ...$lastReadAtBySessionId.get() }
+
+  for (const id of familyIds) {
+    nextReadMap[id] = lastReadAt
+  }
+
+  $lastReadAtBySessionId.set(nextReadMap)
+  $unreadFinishedSessionIds.set($unreadFinishedSessionIds.get().filter(id => !familyIds.has(id)))
 }
 
 export const setMessages = (next: Updater<ChatMessage[]>) => updateAtom($messages, next)
 export const setFreshDraftReady = (next: Updater<boolean>) => updateAtom($freshDraftReady, next)
 export const setResumeFailedSessionId = (next: Updater<string | null>) => updateAtom($resumeFailedSessionId, next)
+
+export const requestSessionResume = (sessionId: string) => {
+  const id = sessionId.trim()
+
+  if (!id) {
+    return
+  }
+
+  $sessionResumeRequest.set({ sequence: ++sessionResumeRequestSequence, sessionId: id })
+}
+
 export const setResumeExhaustedSessionId = (next: Updater<string | null>) => updateAtom($resumeExhaustedSessionId, next)
 export const setBusy = (next: Updater<boolean>) => updateAtom($busy, next)
 export const setAwaitingResponse = (next: Updater<boolean>) => updateAtom($awaitingResponse, next)
@@ -643,11 +853,26 @@ export const setCurrentFastMode = (next: Updater<boolean>) => {
 
 export const setYoloActive = (next: Updater<boolean>) => updateAtom($yoloActive, next)
 
+/** Move the live workspace AND remember it as this backend's workspace.
+ *
+ *  Only for a path the user chose — a folder pick, a project/worktree entry, an
+ *  explicit workspace target. The remembered value is where a new chat starts on
+ *  a remote backend, so writing it from a path the user merely *looked at* makes
+ *  every new chat land in the last session's folder (#77496, #80213). To follow
+ *  a conversation's cwd, use `setCurrentCwdTransient`.
+ */
 export const setCurrentCwd = (next: Updater<string>) => {
   updateAtom($currentCwd, next)
   persistString(workspaceCwdKey(), $currentCwd.get().trim() || null)
 }
 
+export const setTerminalBackend = (next: Updater<string>) => updateAtom($terminalBackend, next)
+
+/** Move the live workspace without claiming it as the user's chosen one.
+ *
+ *  For paths that come from a conversation rather than from the user: resume
+ *  settling, a warm switch, the agent relocating mid-turn, detaching a draft.
+ */
 export const setCurrentCwdTransient = (next: Updater<string>) => updateAtom($currentCwd, next)
 
 // Released-ownership marker: the live path belongs to no conversation. `null`
@@ -680,12 +905,12 @@ export const releaseWorkspaceCwdOwner = () => updateAtom($workspaceCwdOwner, WOR
  *
  *  The single primitive for "this path IS the selected conversation's" — a folder
  *  pick, a project entry, the agent relocating itself. Prefer it over a bare
- *  `setCurrentCwd`, which moves the path while leaving ownership naming whatever
- *  held it before; workspace-derived slices then stay hidden even though the
- *  path is correct (#71254).
+ *  `setCurrentCwdTransient`, which moves the path while leaving ownership naming
+ *  whatever held it before; workspace-derived slices then stay hidden even though
+ *  the path is correct (#71254).
  */
 export const commitWorkspaceCwdForSelectedSession = (cwd: string) => {
-  setCurrentCwd(cwd)
+  setCurrentCwdTransient(cwd)
   setWorkspaceCwdOwner($selectedStoredSessionId.get())
 }
 

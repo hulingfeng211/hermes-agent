@@ -17,6 +17,8 @@ import { Switch } from '@/components/ui/switch'
 import {
   type EnterpriseSkillHubSourceConfig,
   getSkillHubConfig,
+  type ProfileScope,
+  profileScopeKey,
   saveSkillHubConfig,
   type SkillHubMode,
   type SkillHubSourceProbeResponse,
@@ -32,6 +34,7 @@ const HUB_CONFIG_KEY = ['skill-hub-config'] as const
 interface HubSourcesDialogProps {
   onOpenChange: (open: boolean) => void
   open: boolean
+  profile?: ProfileScope
 }
 
 interface SourceDraft {
@@ -96,21 +99,26 @@ function toSource(draft: SourceDraft, existing: EnterpriseSkillHubSourceConfig[]
 }
 
 function probeTone(status?: SkillHubSourceProbeResponse['status']): string {
-  if (status === 'online') {return 'text-emerald-400'}
+  if (status === 'online') {
+    return 'text-emerald-400'
+  }
 
-  if (status === 'cached') {return 'text-amber-400'}
+  if (status === 'cached') {
+    return 'text-amber-400'
+  }
 
   return 'text-destructive'
 }
 
-export function HubSourcesDialog({ onOpenChange, open }: HubSourcesDialogProps) {
+export function HubSourcesDialog({ onOpenChange, open, profile }: HubSourcesDialogProps) {
   const { t } = useI18n()
   const h = t.skills.hub.sources
   const queryClient = useQueryClient()
+  const scopeKey = profileScopeKey(profile)
 
   const configQuery = useQuery({
-    queryKey: HUB_CONFIG_KEY,
-    queryFn: getSkillHubConfig,
+    queryKey: [...HUB_CONFIG_KEY, scopeKey],
+    queryFn: () => getSkillHubConfig(profile),
     enabled: open,
     staleTime: 30_000
   })
@@ -125,7 +133,9 @@ export function HubSourcesDialog({ onOpenChange, open }: HubSourcesDialogProps) 
   const [probeResults, setProbeResults] = useState<Record<string, SkillHubSourceProbeResponse>>({})
 
   useEffect(() => {
-    if (!open || !configQuery.data) {return}
+    if (!open || !configQuery.data) {
+      return
+    }
     setMode(configQuery.data.mode)
     setSources(configQuery.data.sources)
     setDraft(emptyDraft())
@@ -183,18 +193,25 @@ export function HubSourcesDialog({ onOpenChange, open }: HubSourcesDialogProps) 
 
     setFormError('')
 
-    return toSource(draft, sources.filter(source => source.id !== draft.id))
+    return toSource(
+      draft,
+      sources.filter(source => source.id !== draft.id)
+    )
   }
 
   const upsertDraft = () => {
     const source = validateDraft()
 
-    if (!source) {return}
+    if (!source) {
+      return
+    }
 
     setSources(current => {
       const index = current.findIndex(item => item.id === draft.id)
 
-      if (index < 0) {return [...current, source]}
+      if (index < 0) {
+        return [...current, source]
+      }
 
       const next = [...current]
       next[index] = source
@@ -202,7 +219,9 @@ export function HubSourcesDialog({ onOpenChange, open }: HubSourcesDialogProps) 
       return next
     })
 
-    if (mode === 'public') {setMode('hybrid')}
+    if (mode === 'public') {
+      setMode('hybrid')
+    }
     setDraft(emptyDraft())
     setShowForm(false)
   }
@@ -211,7 +230,7 @@ export function HubSourcesDialog({ onOpenChange, open }: HubSourcesDialogProps) 
     setProbingId(key)
 
     try {
-      const result = await testSkillHubSource(source)
+      const result = await testSkillHubSource(source, profile)
       setProbeResults(current => ({ ...current, [key]: result }))
     } catch (error) {
       notifyError(error, h.testFailed)
@@ -223,16 +242,18 @@ export function HubSourcesDialog({ onOpenChange, open }: HubSourcesDialogProps) 
   const probeDraft = () => {
     const source = validateDraft()
 
-    if (source) {void probe(source, '__draft__')}
+    if (source) {
+      void probe(source, '__draft__')
+    }
   }
 
   const save = async () => {
     setSaving(true)
 
     try {
-      await saveSkillHubConfig({ mode, sources })
+      await saveSkillHubConfig({ mode, sources }, profile)
       await Promise.all([
-        queryClient.invalidateQueries({ queryKey: HUB_CONFIG_KEY }),
+        queryClient.invalidateQueries({ queryKey: [...HUB_CONFIG_KEY, scopeKey] }),
         queryClient.invalidateQueries({ queryKey: HUB_SOURCES_KEY })
       ])
       notify({ kind: 'success', message: h.saved })
@@ -430,7 +451,11 @@ export function HubSourcesDialog({ onOpenChange, open }: HubSourcesDialogProps) 
           <Button onClick={() => onOpenChange(false)} size="sm" variant="text">
             {h.cancel}
           </Button>
-          <Button disabled={saving || configQuery.isLoading || configQuery.isError} onClick={() => void save()} size="sm">
+          <Button
+            disabled={saving || configQuery.isLoading || configQuery.isError}
+            onClick={() => void save()}
+            size="sm"
+          >
             {saving && <Loader2 className="animate-spin" />}
             {saving ? h.saving : h.save}
           </Button>
