@@ -172,6 +172,28 @@ class TestAsyncIsSafeUrl:
 
 
 class TestSSRFGuardedHttpxClient:
+    def test_explicit_private_allow_keeps_metadata_floor(self):
+        with _resolves_to("10.20.30.40"):
+            assert is_safe_url(
+                "http://skills.corp/index.json",
+                allow_private_urls=True,
+            ) is True
+
+        with _resolves_to("169.254.169.254"):
+            assert is_safe_url(
+                "http://metadata-proxy.corp/latest/meta-data",
+                allow_private_urls=True,
+            ) is False
+
+    def test_connect_guard_accepts_explicit_private_origin(self):
+        with _resolves_to("10.20.30.40"):
+            assert _resolved_http_connect_ips(
+                "skills.corp",
+                80,
+                "http",
+                allow_private_urls=True,
+            ) == ["10.20.30.40"]
+
     def test_connect_resolution_checks_private_ip_beyond_candidate_cap(self):
         answers = [
             (socket.AF_INET, socket.SOCK_STREAM, 6, "", (f"93.184.216.{idx}", 80))

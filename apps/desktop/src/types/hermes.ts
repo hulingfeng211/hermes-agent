@@ -1254,11 +1254,41 @@ export interface StaleAuxAssignment {
 export interface SkillHubSource {
   id: string
   label: string
+  kind?: 'enterprise' | 'local' | 'public'
+  status?: 'cached' | 'online' | 'unknown' | 'unreachable'
+  endpoint?: string | null
+  configured?: boolean
+  removable?: boolean
+  last_synced_at?: string | null
   available?: boolean
   rate_limited?: boolean
   // False when the centralized index already covers this source, so the UI's
   // per-source search fan-out skips it (avoids redundant external API calls).
   searchable?: boolean
+}
+
+export type SkillHubMode = 'hybrid' | 'private' | 'public'
+
+export interface EnterpriseSkillHubSourceConfig {
+  id: string
+  label: string
+  index_url: string
+  token_env: string
+  allow_private_network: boolean
+  ca_bundle: string
+}
+
+export interface SkillHubConfigResponse {
+  mode: SkillHubMode
+  sources: EnterpriseSkillHubSourceConfig[]
+}
+
+export interface SkillHubSourceProbeResponse {
+  ok: boolean
+  status: 'cached' | 'online' | 'unreachable'
+  last_error: string | null
+  last_synced_at: string | null
+  skill_count: number
 }
 
 /** A searchable/installable hub skill from `GET /api/skills/hub/search`. */
@@ -1280,6 +1310,7 @@ export interface SkillHubInstalledEntry {
 
 export interface SkillHubSourcesResponse {
   sources: SkillHubSource[]
+  mode: SkillHubMode
   index_available: boolean
   featured: SkillHubResult[]
   installed: Record<string, SkillHubInstalledEntry>

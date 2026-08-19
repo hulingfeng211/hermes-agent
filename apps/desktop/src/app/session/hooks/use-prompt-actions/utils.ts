@@ -4,6 +4,7 @@ import { translateNow, type Translations } from '@/i18n'
 import type { ChatMessage } from '@/lib/chat-messages'
 import { type CommandsCatalogLike, filterDesktopCommandsCatalog } from '@/lib/desktop-slash-commands'
 import { isProviderSetupErrorMessage } from '@/lib/provider-setup-errors'
+import type { TurnMetadata } from '@/lib/turn-metadata'
 import type { ComposerAttachment } from '@/store/composer'
 
 export type GatewayRequest = <T>(method: string, params?: Record<string, unknown>, timeoutMs?: number) => Promise<T>
@@ -519,8 +520,42 @@ export function visibleUserIndexAtOrdinal(messages: readonly ChatMessage[], targ
   return -1
 }
 
+/** Wrap a renderer-local admission receipt at the boundary that owns retries.
+ * A callback failure cannot undo an already-admitted turn. */
+export function oneShotComposerAdmission(callback?: () => void): (() => void) | undefined {
+  if (!callback) {
+    return undefined
+  }
+
+  let committed = false
+
+  return () => {
+    if (committed) {
+      return
+    }
+
+    committed = true
+
+    try {
+      callback()
+    } catch {
+      // Admission is authoritative; plugin cleanup cannot veto the turn.
+    }
+  }
+}
+
 export interface SubmitTextOptions {
   attachments?: ComposerAttachment[]
+  /** Namespaced, JSON-safe extension data for exactly this new turn. */
+  turnMetadata?: TurnMetadata
+  /** Internal composer marker: middleware already ran before this prompt was
+   * queued, so draining must preserve its snapshot rather than re-running the
+   * live contribution chain. Never forwarded to the gateway. */
+  composerPrepared?: true
+  /** Internal, one-shot middleware admission receipt. Invoke immediately
+   * before the first real `prompt.submit`, or after a future turn is accepted
+   * into the composer queue. Never forward or persist it. */
+  commitComposerAdmission?: () => void
   /** The composer scope key that was actually loaded when this text was
    *  submitted (see use-composer-draft's activeQueueSessionKeyRef). Compared
    *  against the resolved submit target in sessionContextDrift — a mismatch

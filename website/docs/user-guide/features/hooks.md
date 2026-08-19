@@ -528,7 +528,8 @@ Fires **once per turn**, before the tool-calling loop begins. This is the **only
 
 ```python
 def my_callback(session_id: str, user_message: str, conversation_history: list,
-                is_first_turn: bool, model: str, platform: str, **kwargs):
+                is_first_turn: bool, model: str, provider: str, base_url: str,
+                api_mode: str, platform: str, **kwargs):
 ```
 
 | Parameter | Type | Description |
@@ -538,6 +539,9 @@ def my_callback(session_id: str, user_message: str, conversation_history: list,
 | `conversation_history` | `list` | Copy of the full message list (OpenAI format: `[{"role": "user", "content": "..."}]`) |
 | `is_first_turn` | `bool` | `True` if this is the first turn of a new session, `False` on subsequent turns |
 | `model` | `str` | The model identifier (e.g. `"anthropic/claude-sonnet-4.6"`) |
+| `provider` | `str` | The resolved provider for this turn (e.g. `"anthropic"` or `"openrouter"`) |
+| `base_url` | `str` | The resolved provider endpoint for this turn |
+| `api_mode` | `str` | The resolved API protocol (e.g. `"chat_completions"`, `"anthropic_messages"`, or `"codex_responses"`) |
 | `platform` | `str` | Where the session is running: `"cli"`, `"telegram"`, `"discord"`, etc. |
 
 **Fires:** In `run_agent.py`, inside `run_conversation()`, after context compression but before the main `while` loop. Fires once per `run_conversation()` call (i.e. once per user turn), not once per API call within the tool loop.

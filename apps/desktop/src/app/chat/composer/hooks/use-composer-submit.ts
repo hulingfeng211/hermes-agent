@@ -5,7 +5,7 @@ import { triggerHaptic } from '@/lib/haptics'
 import { hasClarifyRequest, skipClarifyRequest } from '@/store/clarify'
 import { clearSessionDraft, type ComposerAttachment } from '@/store/composer'
 import { resetBrowseState } from '@/store/composer-input-history'
-import { enqueueQueuedPrompt, type QueuedPromptEntry } from '@/store/composer-queue'
+import type { QueuedPromptEntry } from '@/store/composer-queue'
 
 import { cloneAttachments, type QueueEditState } from '../composer-utils'
 import { onComposerSubmitRequest } from '../focus'
@@ -32,7 +32,7 @@ interface UseComposerSubmitArgs {
   onCancel: ChatBarProps['onCancel']
   onSteer: ChatBarProps['onSteer']
   onSubmit: ChatBarProps['onSubmit']
-  queueCurrentDraft: () => boolean
+  queueCurrentDraft: (snapshot?: { attachments: ComposerAttachment[]; text: string }) => boolean | Promise<boolean>
   queueEdit: QueueEditState | null
   queuedPrompts: QueuedPromptEntry[]
   sessionId: string | null | undefined
@@ -183,7 +183,7 @@ export function useComposerSubmit({
       } else if (payloadPresent) {
         // Attachments can't ride a redirect (no tool-result image carriage) —
         // queue the whole payload for the next turn.
-        queueCurrentDraft()
+        void queueCurrentDraft()
       } else {
         // Stop button (the only way to reach here while busy with an empty
         // composer — empty Enter is short-circuited in the keydown handler).
@@ -221,7 +221,10 @@ export function useComposerSubmit({
 
     void Promise.resolve(onSteer(text)).then(accepted => {
       if (!accepted && activeQueueSessionKey) {
-        enqueueQueuedPrompt(activeQueueSessionKey, { text, attachments: [] })
+        // A rejected redirect becomes a NEW queued turn. Admit it through the
+        // same middleware path as every other queue entry so metadata and
+        // deferred commit callbacks bind to this exact fallback turn.
+        void queueCurrentDraft({ text, attachments: [] })
       }
     })
   }
@@ -231,7 +234,7 @@ export function useComposerSubmit({
       return
     }
 
-    queueCurrentDraft()
+    void queueCurrentDraft()
     focusInput()
   }
 

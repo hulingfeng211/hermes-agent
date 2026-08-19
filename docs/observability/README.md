@@ -112,8 +112,8 @@ These hooks frame the user turn, not individual provider API attempts:
 | `post_llm_call` | After the turn completes with final assistant output. |
 
 Common `pre_llm_call` fields include `session_id`, `turn_id`,
-`user_message`, `conversation_history`, `is_first_turn`, `model`, `platform`,
-and `sender_id`.
+`user_message`, `conversation_history`, `is_first_turn`, `model`, `provider`,
+`base_url`, `api_mode`, `platform`, and `sender_id`.
 
 Common `post_llm_call` fields include `session_id`, `turn_id`,
 `user_message`, `assistant_response`, `conversation_history`, `model`, and

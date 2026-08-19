@@ -30,7 +30,7 @@ import {
   slashArgStage
 } from './composer-utils'
 import { ContextMenu } from './context-menu'
-import { COMPOSER_AREAS, runComposerMiddleware } from './contrib'
+import { COMPOSER_AREAS, ComposerContextProvider, type ComposerContextValue, prepareComposerDraft } from './contrib'
 import { ComposerControls } from './controls'
 import { ComposerDirectiveActions } from './directive-actions'
 import { COMPOSER_DROP_ACTIVE_CLASS, COMPOSER_DROP_FADE_CLASS } from './drop-affordance'
@@ -77,6 +77,19 @@ import { UrlDialog } from './url-dialog'
 import { chipTypedUrlOnSpace, linkifyUrls } from './url-refs'
 import { VoiceActivity, VoicePlaybackActivity } from './voice-activity'
 
+interface ComposerContextSlotProps {
+  area: string
+  value: ComposerContextValue
+}
+
+function ComposerContextSlot({ area, value }: ComposerContextSlotProps) {
+  return (
+    <ComposerContextProvider value={value}>
+      <ContribSlot area={area} />
+    </ComposerContextProvider>
+  )
+}
+
 export function ChatBar({
   busy,
   cwd,
@@ -105,6 +118,18 @@ export function ChatBar({
   // end control. Populated after useComposerVoice below (the submit wrapper
   // is created first); render-time assignment keeps the ref current.
   const voiceStopRef = useRef<{ active: boolean; end: () => void }>({ active: false, end: () => {} })
+  const activeQueueSessionKey = queueSessionKey || sessionId || null
+
+  const composerContext = useMemo<ComposerContextValue>(
+    () =>
+      Object.freeze({
+        runtimeSessionId: sessionId ?? null,
+        // `queueSessionKey` is already resolved to the durable lineage root;
+        // do not substitute the runtime fallback used only for queue storage.
+        storedSessionId: queueSessionKey ?? null
+      }),
+    [queueSessionKey, sessionId]
+  )
 
   // Every send (typed, queued, voice) passes through the contributed
   // middleware chain first — rewrite / pass-through / cancel. Empty chain =
@@ -126,15 +151,29 @@ export function ChatBar({
         return true
       }
 
-      const draft = await runComposerMiddleware({ text: value, attachments: options?.attachments })
+      const prepared = await prepareComposerDraft(
+        {
+          text: value,
+          attachments: options?.attachments,
+          turnMetadata: options?.turnMetadata
+        },
+        options?.composerPrepared,
+        composerContext
+      )
 
-      if (!draft) {
+      if (!prepared) {
         return false
       }
 
-      return onSubmitProp(draft.text, { ...options, attachments: draft.attachments })
+      return onSubmitProp(prepared.draft.text, {
+        ...options,
+        attachments: prepared.draft.attachments,
+        turnMetadata: prepared.draft.turnMetadata,
+        composerPrepared: true,
+        ...(prepared.commit ? { commitComposerAdmission: prepared.commit } : {})
+      })
     },
-    [onSubmitProp]
+    [composerContext, onSubmitProp]
   )
 
   // Which live composer this instance IS (main | tile) — its attachment set,
@@ -149,8 +188,6 @@ export function ChatBar({
   // would discard a question the user may want to come back to. The blocking
   // prompt owns its own dismissal (Skip, Reject, dialog close).
   const awaitingInput = useStore(scope.$awaitingInput)
-  const activeQueueSessionKey = queueSessionKey || sessionId || null
-
   // Status items (subagents, background processes) are keyed by the RUNTIME
   // session id — gateway events and process.list both speak that id. Only the
   // queue uses the stored-session fallback key (prompts can queue pre-resume).
@@ -256,6 +293,7 @@ export function ChatBar({
     stepQueuedEdit
   } = useComposerQueue({
     activeQueueSessionKey,
+    activeQueueSessionKeyRef,
     attachments,
     busy,
     clearDraft,
@@ -1213,7 +1251,7 @@ export function ChatBar({
                   {/* Contribution seams: banners above, a row below, inline
                     additions beside the "+" menu and before the controls.
                     All four render nothing until something contributes. */}
-                  <ContribSlot area={COMPOSER_AREAS.top} />
+                  <ComposerContextSlot area={COMPOSER_AREAS.top} value={composerContext} />
                   <VoiceActivity state={voiceActivityState} />
                   <VoicePlaybackActivity />
                   {queueEdit && editingQueuedPrompt && (
@@ -1251,15 +1289,15 @@ export function ChatBar({
                   >
                     <div className="flex translate-y-[3px] items-start gap-(--composer-control-gap) self-start [grid-area:menu]">
                       {contextMenu}
-                      <ContribSlot area={COMPOSER_AREAS.leading} />
+                      <ComposerContextSlot area={COMPOSER_AREAS.leading} value={composerContext} />
                     </div>
                     <div className="min-w-0 [grid-area:input]">{input}</div>
                     <div className="flex items-center justify-end gap-(--composer-control-gap) [grid-area:controls]">
-                      <ContribSlot area={COMPOSER_AREAS.actions} />
+                      <ComposerContextSlot area={COMPOSER_AREAS.actions} value={composerContext} />
                       {controls}
                     </div>
                   </div>
-                  <ContribSlot area={COMPOSER_AREAS.bottom} />
+                  <ComposerContextSlot area={COMPOSER_AREAS.bottom} value={composerContext} />
                 </div>
               </div>
             </div>
@@ -1269,7 +1307,7 @@ export function ChatBar({
               the pop-out drag region. Same px as the strip above, so the two
               bracket the composer on one vertical line. */}
           <div className={cn(composerFloatingStrip, 'px-[5px] pt-1.5 empty:hidden')}>
-            <ContribSlot area={COMPOSER_AREAS.underside} />
+            <ComposerContextSlot area={COMPOSER_AREAS.underside} value={composerContext} />
           </div>
         </div>
       </ComposerPrimitive.Unstable_TriggerPopoverRoot>

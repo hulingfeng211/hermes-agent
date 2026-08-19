@@ -544,6 +544,26 @@ class SkillsUpdateRequest(BaseModel):
     profile: Optional[str] = None
 
 
+class EnterpriseSkillHubSourceConfig(BaseModel):
+    id: str
+    label: str
+    index_url: str
+    token_env: str = ""
+    allow_private_network: bool = True
+    ca_bundle: str = ""
+
+
+class SkillHubConfigUpdate(BaseModel):
+    mode: Literal["public", "hybrid", "private"] = "public"
+    sources: List[EnterpriseSkillHubSourceConfig] = []
+    profile: Optional[str] = None
+
+
+class SkillHubSourceProbeRequest(BaseModel):
+    source: EnterpriseSkillHubSourceConfig
+    profile: Optional[str] = None
+
+
 # --- from web_server.py (originally lines 15116-15166) ---
 
 class ProfileCreate(BaseModel):
@@ -722,4 +742,3 @@ class _PluginProvidersPutBody(BaseModel):
 
 class _PluginVisibilityBody(BaseModel):
     hidden: bool
-

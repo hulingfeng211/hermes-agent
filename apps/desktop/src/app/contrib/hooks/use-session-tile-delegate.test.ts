@@ -33,12 +33,15 @@ const row = (over: Partial<SessionInfo>): SessionInfo =>
     ...over
   }) as SessionInfo
 
-function renderTile(requestGateway: ReturnType<typeof vi.fn>) {
+function renderTile(
+  requestGateway: ReturnType<typeof vi.fn>,
+  executeSlashCommand = vi.fn(async () => undefined) as never
+) {
   renderHook(() =>
     useSessionTileDelegate({
       archiveSession: vi.fn(async () => undefined),
       branchStoredSession: vi.fn(async () => undefined),
-      executeSlashCommand: vi.fn(async () => undefined) as never,
+      executeSlashCommand,
       removeSession: vi.fn(async () => undefined),
       requestGateway: requestGateway as never,
       runtimeIdByStoredSessionIdRef: { current: new Map() },
@@ -46,6 +49,8 @@ function renderTile(requestGateway: ReturnType<typeof vi.fn>) {
       updateSessionState: vi.fn()
     })
   )
+
+  return { executeSlashCommand }
 }
 
 describe('useSessionTileDelegate resumeTile', () => {
@@ -97,6 +102,30 @@ describe('useSessionTileDelegate resumeTile', () => {
       cols: 96,
       profile: 'default',
       omit_messages: true
+    })
+  })
+
+  it('forwards a prepared admission receipt through a tile slash dispatch', async () => {
+    const executeSlashCommand = vi.fn(async () => undefined)
+    const commitComposerAdmission = vi.fn()
+    const turnMetadata = { 'acme.review': { mode: 'strict' } }
+
+    renderTile(
+      vi.fn(async () => ({}) as never),
+      executeSlashCommand as never
+    )
+
+    await sessionTileDelegate()!.executeSlash('/goal audit this tile', 'runtime-tile', {
+      commitComposerAdmission,
+      composerPrepared: true,
+      turnMetadata
+    })
+
+    expect(executeSlashCommand).toHaveBeenCalledWith('/goal audit this tile', {
+      commitComposerAdmission,
+      composerPrepared: true,
+      sessionId: 'runtime-tile',
+      turnMetadata
     })
   })
 })

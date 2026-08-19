@@ -81,8 +81,8 @@ export function useSessionTileDelegate({
       deleteSession: async storedSessionId => {
         await removeSession(storedSessionId)
       },
-      executeSlash: async (rawCommand, sessionId) => {
-        await executeSlashCommand(rawCommand, { sessionId })
+      executeSlash: async (rawCommand, sessionId, options) => {
+        await executeSlashCommand(rawCommand, { sessionId, ...options })
       },
       interruptSession: async runtimeId => {
         await withSessionNotFoundResume(

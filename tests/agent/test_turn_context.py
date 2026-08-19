@@ -208,6 +208,54 @@ def test_returns_turn_context_with_user_message_appended():
     assert ctx.active_system_prompt == "SYSTEM"
 
 
+def test_pre_llm_plugin_receives_resolved_endpoint_context(monkeypatch):
+    """The turn hook exposes the route restored for this turn, not stale input."""
+    from hermes_cli import plugins
+    from hermes_cli.plugins import PluginContext, PluginManifest, PluginManager
+
+    manager = PluginManager()
+    plugin_ctx = PluginContext(
+        PluginManifest(name="endpoint-policy", source="test", key="endpoint-policy"),
+        manager,
+    )
+    received = {}
+
+    def endpoint_policy_hook(
+        *, model, provider, base_url, api_mode, platform, **_kwargs
+    ):
+        received.update(
+            model=model,
+            provider=provider,
+            base_url=base_url,
+            api_mode=api_mode,
+            platform=platform,
+        )
+
+    plugin_ctx.register_hook("pre_llm_call", endpoint_policy_hook)
+    monkeypatch.setattr(plugins, "_plugin_manager", manager)
+
+    agent = _FakeAgent()
+
+    def restore_resolved_route():
+        agent.model = "resolved/model"
+        agent.provider = "resolved-provider"
+        agent.base_url = "https://resolved.example/v1"
+        agent.api_mode = "codex_responses"
+        agent.platform = "desktop"
+        return True
+
+    agent._restore_primary_runtime = restore_resolved_route
+    _build(agent)
+
+    assert received == {
+        "model": "resolved/model",
+        "provider": "resolved-provider",
+        "base_url": "https://resolved.example/v1",
+        "api_mode": "codex_responses",
+        "platform": "desktop",
+    }
+
+
 # ── Trivial-prompt prefetch gate (PR #25350 salvage) ─────────────────────────
 #
 # The prologue is the ONLY place the per-turn synchronous
@@ -363,7 +411,6 @@ def test_between_turns_refresh_adds_late_tool_when_servers_registered():
 
     assert "mcp_x_tool" in agent.valid_tool_names
     assert any(t["function"]["name"] == "mcp_x_tool" for t in agent.tools)
-
 
 
 

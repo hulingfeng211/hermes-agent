@@ -565,6 +565,7 @@ hermes skills tap add myorg/skills-repo           # Add a custom GitHub source
 | `official` | `official/security/1password` | Optional skills shipped with Hermes. |
 | `skills-sh` | `skills-sh/vercel-labs/agent-skills/vercel-react-best-practices` | Searchable via `hermes skills search <query> --source skills-sh`. Hermes resolves alias-style skills when the skills.sh slug differs from the repo folder. |
 | `well-known` | `well-known:https://mintlify.com/docs/.well-known/skills/mintlify` | Skills served directly from `/.well-known/skills/index.json` on a website. Search using the site or docs URL. |
+| `enterprise:<id>` | `enterprise:corp/deploy-helper` | A persistent, profile-scoped well-known endpoint configured for an organization. Supports private network addresses, bearer-token references, custom CA bundles, and private-only mode. |
 | `url` | `https://sharethis.chat/SKILL.md` | Direct HTTP(S) URL to `SKILL.md` plus explicitly referenced support files. Name resolution: frontmatter → URL slug → interactive prompt → `--name` flag. |
 | `github` | `openai/skills/k8s` | Direct GitHub repo/path installs and custom taps. |
 | `clawhub`, `lobehub`, `browse-sh` | Source-specific identifiers | Community or marketplace integrations. |
@@ -614,6 +615,45 @@ hermes skills search https://mintlify.com/docs --source well-known
 hermes skills inspect well-known:https://mintlify.com/docs/.well-known/skills/mintlify
 hermes skills install well-known:https://mintlify.com/docs/.well-known/skills/mintlify
 ```
+
+### Enterprise Skill Hubs and private-network mode
+
+The Desktop **Skills & Tools → Browse Hub** view can persist one or more
+organization-owned endpoints. Open **Manage skill sources**, add the endpoint,
+test it, and choose the source policy for the current profile:
+
+- `public` — only the built-in public registries (the backward-compatible default)
+- `hybrid` — public registries plus configured enterprise sources
+- `private` — local optional skills plus configured enterprise sources; public
+  adapters are not constructed or probed
+
+The same settings can be managed in `config.yaml`:
+
+```yaml
+skills:
+  hub:
+    mode: private
+    sources:
+      - id: corp
+        label: Corporate Skill Hub
+        index_url: https://skills.corp/.well-known/skills/index.json
+        token_env: CORP_SKILLHUB_TOKEN
+        allow_private_network: true
+        ca_bundle: /etc/ssl/corp-ca.pem
+```
+
+Put the token value in the profile's `.env`, never in `config.yaml` or the URL:
+
+```dotenv
+CORP_SKILLHUB_TOKEN=replace-with-the-real-token
+```
+
+Private-address access is scoped to the configured source origin. Redirects
+cannot leave that origin, and cloud metadata/link-local targets remain blocked.
+Enterprise skills keep `community` trust and run through the normal quarantine,
+security scan, install audit, and update provenance checks. A last-successful
+index remains browsable if the hub is temporarily unavailable; installing a
+skill whose files were not previously fetched still requires the hub.
 
 #### 4. Direct GitHub skills (`github`)
 

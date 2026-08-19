@@ -116,7 +116,16 @@ export const host = {
 // Every contribution surface, plugin-reachable: register keybinds, palette
 // commands, routes, themes, panes, composer extensions, and bar items with
 // the same area ids + payload types core uses.
-export { COMPOSER_AREAS, type ComposerAttachmentProvider, type ComposerMiddleware } from '@/app/chat/composer/contrib'
+export {
+  COMPOSER_AREAS,
+  type ComposerAttachmentProvider,
+  type ComposerContextValue,
+  type ComposerDraft,
+  type ComposerMiddleware,
+  type ComposerMiddlewareOutput,
+  type ComposerMiddlewareResult,
+  useComposerContext
+} from '@/app/chat/composer/contrib'
 
 // -- ui: the design language --------------------------------------------------
 
@@ -266,6 +275,7 @@ export const TITLEBAR_AREAS = { center: 'titleBar.center', left: 'titleBar.left'
  *  readiness from raw RPC shapes. */
 export { evaluateRuntimeReadiness, type RuntimeReadinessResult } from '@/lib/runtime-readiness'
 export { coarseElapsed, fmtDateTime, fmtDayTime, relativeTime } from '@/lib/time'
+export type { JsonPrimitive, JsonValue, TurnMetadata } from '@/lib/turn-metadata'
 export { cn } from '@/lib/utils'
 export { THEMES_AREA } from '@/themes/user-themes'
 export type { RpcEvent, StatusResponse } from '@/types/hermes'

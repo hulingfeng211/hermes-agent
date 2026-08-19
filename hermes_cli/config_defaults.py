@@ -1833,6 +1833,13 @@ DEFAULT_CONFIG = {
     # always goes to ~/.hermes/skills/.
     "skills": {
         "external_dirs": [],   # e.g. ["~/.agents/skills", "/shared/team-skills"]
+        # Skills Hub source policy. Enterprise sources use the existing
+        # /.well-known/skills/index.json protocol. Tokens remain in .env; only
+        # the environment-variable name is stored here.
+        "hub": {
+            "mode": "public",  # public | hybrid | private
+            "sources": [],
+        },
         # Substitute ${HERMES_SKILL_DIR} and ${HERMES_SESSION_ID} in SKILL.md
         # content with the absolute skill directory and the active session id
         # before the agent sees it.  Lets skill authors reference bundled

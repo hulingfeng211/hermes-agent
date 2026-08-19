@@ -295,6 +295,7 @@ Browse, search, and toggle installed skills and toolsets, and install new ones f
 - **Toggle** — enable or disable individual skills with a switch. Changes take effect on the next session.
 - **Toolsets** — a separate view shows built-in toolsets (file operations, web browsing, etc.) with their active/inactive status, setup requirements, and list of included tools
 - **Browse hub** — a third view searches the skill hub across all sources (the same as `hermes skills search`), installs any result by identifier with a live install log, and offers an "Update all" button to refresh installed skills.
+- **Enterprise sources** — the source manager adds profile-scoped internal `/.well-known/skills/index.json` registries, tests connectivity, and can enforce a private-only mode that never constructs or probes public registry adapters.
 
 ![Skills admin page — the Browse hub view: search, install, and update](/img/dashboard/admin-skills-hub.png)
 

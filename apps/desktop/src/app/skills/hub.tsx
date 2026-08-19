@@ -17,6 +17,7 @@ import {
   DialogHeader,
   DialogTitle
 } from '@/components/ui/dialog'
+import { Tip } from '@/components/ui/tooltip'
 import {
   getSkillHubSources,
   previewSkillHub,
@@ -27,7 +28,7 @@ import {
 } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { stripAnsi } from '@/lib/ansi'
-import { Loader2 } from '@/lib/icons'
+import { Loader2, Lock, Settings2 } from '@/lib/icons'
 import { cn } from '@/lib/utils'
 import {
   $hubActions,
@@ -41,6 +42,8 @@ import {
   updateHubSkills
 } from '@/store/hub-actions'
 import { notify, notifyError } from '@/store/notifications'
+
+import { HubSourcesDialog } from './hub-sources-dialog'
 
 // Dedup rank when the same skill surfaces from multiple sources — higher trust
 // wins. Mirrors the backend's unified_search `_TRUST_RANK`.
@@ -189,6 +192,7 @@ export function SkillsHub({ query }: SkillsHubProps) {
   const [detail, setDetail] = useState<null | SkillHubResult>(null)
   const [scan, setScan] = useState<null | SkillHubScanResult>(null)
   const [scanning, setScanning] = useState(false)
+  const [sourcesOpen, setSourcesOpen] = useState(false)
 
   const previewQuery = useQuery({
     queryKey: ['skill-hub-preview', detail?.identifier],
@@ -282,12 +286,35 @@ export function SkillsHub({ query }: SkillsHubProps) {
 
   return (
     <div className="flex h-full min-h-0 flex-col">
-      {/* Connected hubs — label on its own line, chips below, roomy padding. */}
+      {/* Source summary + management. */}
       <div className="shrink-0 px-4 pt-5 pb-8 text-[0.68rem] text-(--ui-text-tertiary)">
-        <span className="mb-1.5 block">{h.connectedHubs}</span>
+        <div className="mb-1.5 flex items-center justify-between gap-3">
+          <span>{h.connectedHubs}</span>
+          <div className="flex items-center gap-2">
+            {sourcesQuery.data?.mode === 'private' && (
+              <span className="inline-flex items-center gap-1 text-[0.62rem] text-emerald-400">
+                <Lock className="size-3" />
+                {h.privateMode}
+              </span>
+            )}
+            <Tip label={h.manageSources}>
+              <Button
+                aria-label={h.manageSources}
+                onClick={() => setSourcesOpen(true)}
+                size="icon-xs"
+                variant="ghost"
+              >
+                <Settings2 />
+              </Button>
+            </Tip>
+          </div>
+        </div>
         <div className="flex flex-wrap items-center gap-1.5">
-          {sourcesQuery.isLoading
-            ? null
+          {sourcesQuery.isError ? (
+            <Button onClick={() => void sourcesQuery.refetch()} size="inline" variant="textStrong">
+              {h.loadFailed}
+            </Button>
+          ) : sourcesQuery.isLoading ? null
             : sources.map(source => {
                 const state = searchStateById.get(source.id)
                 const degraded = source.available === false || source.rate_limited === true || state?.failed
@@ -305,7 +332,10 @@ export function SkillsHub({ query }: SkillsHubProps) {
                   >
                     {/* Spinner overlays the (dimmed) label rather than pushing it,
                         so a chip never resizes as its search starts/finishes. */}
-                    <span className={cn(fetching && 'opacity-30')}>{source.label}</span>
+                    <span className={cn('inline-flex items-center gap-1', fetching && 'opacity-30')}>
+                      {source.kind === 'enterprise' && <Lock className="size-2.5" />}
+                      {source.label}
+                    </span>
                     {fetching && (
                       <span className="absolute inset-0 grid place-items-center">
                         <Loader2 className="size-2.5 animate-spin" />
@@ -463,6 +493,7 @@ export function SkillsHub({ query }: SkillsHubProps) {
           )}
         </DialogContent>
       </Dialog>
+      <HubSourcesDialog onOpenChange={setSourcesOpen} open={sourcesOpen} />
     </div>
   )
 }

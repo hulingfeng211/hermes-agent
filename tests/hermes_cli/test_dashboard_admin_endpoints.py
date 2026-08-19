@@ -634,6 +634,59 @@ class TestSkillsHubSourcesEndpoint:
         assert body["featured"][0]["trust_level"] == "trusted"
         assert isinstance(body["installed"], dict)
 
+    def test_enterprise_source_config_round_trip(self):
+        payload = {
+            "mode": "private",
+            "sources": [
+                {
+                    "id": "corp",
+                    "label": "Corporate Hub",
+                    "index_url": "http://skills.corp",
+                    "token_env": "CORP_SKILLHUB_TOKEN",
+                    "allow_private_network": True,
+                    "ca_bundle": "/etc/ssl/corp-ca.pem",
+                }
+            ],
+        }
+
+        response = self.client.put("/api/skills/hub/config", json=payload)
+        assert response.status_code == 200
+        body = self.client.get("/api/skills/hub/config").json()
+
+        assert body["mode"] == "private"
+        assert body["sources"] == [
+            {
+                **payload["sources"][0],
+                "index_url": "http://skills.corp/.well-known/skills/index.json",
+            }
+        ]
+
+    def test_source_probe_uses_enterprise_adapter(self, monkeypatch):
+        monkeypatch.setattr(
+            "tools.skills_hub.EnterpriseSkillSource.probe",
+            lambda _self: {
+                "ok": True,
+                "status": "online",
+                "last_error": None,
+                "last_synced_at": "2026-08-08T00:00:00+00:00",
+                "skill_count": 7,
+            },
+        )
+        response = self.client.post(
+            "/api/skills/hub/sources/test",
+            json={
+                "source": {
+                    "id": "corp",
+                    "label": "Corporate Hub",
+                    "index_url": "http://10.0.0.5",
+                    "allow_private_network": True,
+                }
+            },
+        )
+
+        assert response.status_code == 200
+        assert response.json()["skill_count"] == 7
+
 
 class TestSkillsHubPreviewEndpoint:
     @pytest.fixture(autouse=True)

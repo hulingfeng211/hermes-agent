@@ -66,6 +66,112 @@ def test_mutator_route_table_matches_prd_inventory():
     }
 
 
+def test_compute_host_frame_carries_ephemeral_turn_metadata():
+    session = {
+        "session_key": "session-key",
+        "history": [{"role": "user", "content": "older"}],
+        "history_lock": threading.Lock(),
+        "history_version": 1,
+        "cols": 80,
+        "attached_images": [],
+    }
+    metadata = {"acme.review": {"mode": "strict"}}
+
+    frame = server._compute_host_turn_frame(
+        "r1", "sid", session, "new", turn_metadata=metadata
+    )
+    metadata["acme.review"]["mode"] = "changed-after-frame"
+
+    assert frame["turn_metadata"] == {"acme.review": {"mode": "strict"}}
+    assert session["history"] == [{"role": "user", "content": "older"}]
+    assert "turn_metadata" not in session
+
+
+def test_compute_host_rejects_bad_turn_metadata_before_dispatch(monkeypatch):
+    output = io.StringIO()
+    host = ComputeHost(stdout=output, heartbeat_secs=0)
+    monkeypatch.setattr(
+        host._executor,
+        "submit",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("invalid metadata must not claim a compute turn")
+        ),
+    )
+    try:
+        host._handle_turn_start(
+            {
+                "type": "turn.start",
+                "sid": "sid",
+                "request_id": "bad",
+                "text": "hello",
+                "turn_metadata": {"Bad Namespace": {}},
+            }
+        )
+    finally:
+        host.close()
+
+    frames = _json_lines(output)
+    assert frames[-1]["type"] == "turn.error"
+    assert frames[-1]["request_id"] == "bad"
+    assert "namespace" in frames[-1]["message"]
+
+
+def test_compute_host_real_turn_forwards_metadata_to_execution(monkeypatch):
+    output = io.StringIO()
+    host = ComputeHost(stdout=output, heartbeat_secs=0)
+    sid = "metadata-host-sid"
+    captured = {}
+    session = {
+        "agent": object(),
+        "session_key": "metadata-host-key",
+        "history": [],
+        "history_lock": threading.Lock(),
+        "history_version": 0,
+        "running": False,
+        "attached_images": [],
+        "cols": 80,
+    }
+
+    def run_prompt(request_id, received_sid, received_session, text, **kwargs):
+        captured.update(
+            request_id=request_id,
+            sid=received_sid,
+            session=received_session,
+            text=text,
+            turn_metadata=kwargs.get("turn_metadata"),
+        )
+        with received_session["history_lock"]:
+            received_session["running"] = False
+
+    monkeypatch.setattr(server, "_run_prompt_submit", run_prompt)
+    monkeypatch.setattr(server, "_ensure_session_db_row", lambda _session: None)
+    monkeypatch.setattr(server, "_persist_branch_seed", lambda _session: None)
+    monkeypatch.setattr(server, "_session_info", lambda *_args: {})
+    server._sessions[sid] = session
+    try:
+        host._run_real_turn(
+            {
+                "type": "turn.start",
+                "sid": sid,
+                "request_id": "metadata-turn",
+                "session_key": "metadata-host-key",
+                "text": "hello",
+                "turn_metadata": {"acme.review": {"mode": "strict"}},
+            }
+        )
+    finally:
+        server._sessions.pop(sid, None)
+        host.close()
+
+    assert captured == {
+        "request_id": "metadata-turn",
+        "sid": sid,
+        "session": session,
+        "text": "hello",
+        "turn_metadata": {"acme.review": {"mode": "strict"}},
+    }
+
+
 def test_append_log_record_single_write_lines(tmp_path):
     path = tmp_path / "agent.log"
 

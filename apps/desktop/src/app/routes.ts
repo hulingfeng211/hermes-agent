@@ -3,6 +3,8 @@ import type { ReactNode } from 'react'
 
 import { noteActiveTreeGroup, revealTreePane } from '@/components/pane-shell/tree/store'
 import { registry } from '@/contrib/registry'
+import type { Contribution } from '@/contrib/types'
+import { type Locale, translatePlugin } from '@/i18n'
 
 type NavigateLike = (to: string, options?: { replace?: boolean }) => void
 
@@ -114,9 +116,36 @@ export const SIDEBAR_NAV_AREA = 'sidebar.nav'
 export interface SidebarNavContribution {
   /** Codicon name, e.g. `'project'`. */
   codicon: string
+  /** Plain fallback label, also used by hosts that predate `labelKey`. */
   label: string
+  /** Plugin-i18n key resolved reactively from the contribution's provenance. */
+  labelKey?: string
   /** Route to navigate to (usually a contributed page's path). */
   path: string
+}
+
+export function sidebarNavContributionLabel(
+  contribution: Pick<Contribution, 'source'>,
+  data: Partial<SidebarNavContribution>,
+  locale: Locale
+): string | null {
+  const fallback = data.label?.trim() || null
+  const key = data.labelKey?.trim()
+  const source = contribution.source
+
+  if (!key || !source?.startsWith('plugin:')) {
+    return fallback
+  }
+
+  const pluginId = source.slice('plugin:'.length)
+
+  if (!pluginId) {
+    return fallback
+  }
+
+  const translated = translatePlugin(pluginId, locale, key, [])
+
+  return translated === key ? fallback : translated
 }
 
 // Views that render as a full-screen modal card (OverlayView) over the shell.

@@ -4,16 +4,19 @@ import {
   getCuratorStatus,
   getMcpCatalog,
   getMemoryStatus,
+  getSkillHubConfig,
   getSkillHubSources,
   getToolsetModels,
   installSkillFromHub,
   resetMemory,
   runDebugShare,
+  saveSkillHubConfig,
   searchSkillsHub,
   selectToolsetModel,
   setCuratorPaused,
   setMcpServerEnabled,
-  testMcpServer
+  testMcpServer,
+  testSkillHubSource
 } from './hermes'
 
 describe('Hermes REST parity helpers (hub / mcp / maintenance)', () => {
@@ -36,6 +39,55 @@ describe('Hermes REST parity helpers (hub / mcp / maintenance)', () => {
     await getSkillHubSources()
 
     expect(api).toHaveBeenCalledWith(expect.objectContaining({ path: '/api/skills/hub/sources', timeoutMs: 45_000 }))
+  })
+
+  it('reads and writes profile-scoped enterprise hub configuration', async () => {
+    await getSkillHubConfig()
+    await saveSkillHubConfig({
+      mode: 'private',
+      sources: [
+        {
+          id: 'corp',
+          label: 'Corporate Hub',
+          index_url: 'http://skills.corp',
+          token_env: '',
+          allow_private_network: true,
+          ca_bundle: ''
+        }
+      ]
+    })
+
+    expect(api).toHaveBeenNthCalledWith(1, expect.objectContaining({ path: '/api/skills/hub/config' }))
+    expect(api).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({
+        path: '/api/skills/hub/config',
+        method: 'PUT',
+        body: expect.objectContaining({ mode: 'private' })
+      })
+    )
+  })
+
+  it('tests a draft enterprise source through the guarded backend path', async () => {
+    const source = {
+      id: 'corp',
+      label: 'Corporate Hub',
+      index_url: 'http://10.0.0.5',
+      token_env: '',
+      allow_private_network: true,
+      ca_bundle: ''
+    }
+
+    await testSkillHubSource(source)
+
+    expect(api).toHaveBeenCalledWith(
+      expect.objectContaining({
+        path: '/api/skills/hub/sources/test',
+        method: 'POST',
+        body: { source },
+        timeoutMs: 45_000
+      })
+    )
   })
 
   it('encodes hub search params', async () => {

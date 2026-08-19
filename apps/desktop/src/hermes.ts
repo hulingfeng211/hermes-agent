@@ -22,6 +22,7 @@ import type {
   CustomEndpointValidationResponse,
   DebugShareResponse,
   ElevenLabsVoicesResponse,
+  EnterpriseSkillHubSourceConfig,
   EnvVarInfo,
   HermesConfig,
   HermesConfigRecord,
@@ -54,9 +55,11 @@ import type {
   SessionInfo,
   SessionMessagesResponse,
   SessionSearchResponse,
+  SkillHubConfigResponse,
   SkillHubPreview,
   SkillHubScanResult,
   SkillHubSearchResponse,
+  SkillHubSourceProbeResponse,
   SkillHubSourcesResponse,
   SkillInfo,
   StarmapGraph,
@@ -158,6 +161,7 @@ export type {
   DebugShareResponse,
   ElevenLabsVoice,
   ElevenLabsVoicesResponse,
+  EnterpriseSkillHubSourceConfig,
   EnvVarInfo,
   GatewayReadyPayload,
   HermesConfig,
@@ -204,12 +208,15 @@ export type {
   SessionRuntimeInfo,
   SessionSearchResponse,
   SessionSearchResult,
+  SkillHubConfigResponse,
   SkillHubInstalledEntry,
+  SkillHubMode,
   SkillHubPreview,
   SkillHubResult,
   SkillHubScanResult,
   SkillHubSearchResponse,
   SkillHubSource,
+  SkillHubSourceProbeResponse,
   SkillHubSourcesResponse,
   SkillInfo,
   StaleAuxAssignment,
@@ -1664,6 +1671,32 @@ export function getSkillHubSources(): Promise<SkillHubSourcesResponse> {
   return window.hermesDesktop.api<SkillHubSourcesResponse>({
     ...profileScoped(),
     path: '/api/skills/hub/sources',
+    timeoutMs: HUB_REQUEST_TIMEOUT_MS
+  })
+}
+
+export function getSkillHubConfig(): Promise<SkillHubConfigResponse> {
+  return window.hermesDesktop.api<SkillHubConfigResponse>({
+    ...profileScoped(),
+    path: '/api/skills/hub/config'
+  })
+}
+
+export function saveSkillHubConfig(config: SkillHubConfigResponse): Promise<SkillHubConfigResponse & { ok: boolean }> {
+  return window.hermesDesktop.api<SkillHubConfigResponse & { ok: boolean }>({
+    ...profileScoped(),
+    path: '/api/skills/hub/config',
+    method: 'PUT',
+    body: config
+  })
+}
+
+export function testSkillHubSource(source: EnterpriseSkillHubSourceConfig): Promise<SkillHubSourceProbeResponse> {
+  return window.hermesDesktop.api<SkillHubSourceProbeResponse>({
+    ...profileScoped(),
+    path: '/api/skills/hub/sources/test',
+    method: 'POST',
+    body: { source },
     timeoutMs: HUB_REQUEST_TIMEOUT_MS
   })
 }

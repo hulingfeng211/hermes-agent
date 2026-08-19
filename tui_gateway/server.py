@@ -32,6 +32,11 @@ from hermes_constants import (
     set_hermes_home_override,
 )
 from hermes_cli.env_loader import load_hermes_dotenv
+from hermes_cli.turn_context import (
+    _bind_turn_metadata,
+    _reset_turn_metadata,
+    normalize_turn_metadata,
+)
 from utils import is_truthy_value
 from tools.environments.local import hermes_subprocess_env
 from agent.replay_cleanup import sanitize_replay_history
@@ -1668,6 +1673,7 @@ def _compute_host_turn_frame(
     text: Any,
     image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
+    turn_metadata: dict[str, Any] | None = None,
 ) -> dict:
     with session["history_lock"]:
         history = list(session.get("history", []))
@@ -1677,7 +1683,7 @@ def _compute_host_turn_frame(
             if image_paths is not None
             else list(session.get("attached_images", []))
         )
-    return {
+    frame = {
         "type": "turn.start",
         "sid": sid,
         "request_id": rid,
@@ -1695,6 +1701,9 @@ def _compute_host_turn_frame(
         "attached_images": attached_images,
         "queued_prompt_generation": queued_prompt_generation,
     }
+    if turn_metadata:
+        frame["turn_metadata"] = copy.deepcopy(turn_metadata)
+    return frame
 
 
 def _metadata_mirror(session: dict | None) -> dict:
@@ -1771,6 +1780,7 @@ def _submit_prompt_to_compute_host(
     text: Any,
     image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
+    turn_metadata: dict[str, Any] | None = None,
 ) -> dict:
     cfg = _load_dashboard_process_isolation_config()
     frame = _compute_host_turn_frame(
@@ -1780,6 +1790,7 @@ def _submit_prompt_to_compute_host(
         text,
         image_paths=image_paths,
         queued_prompt_generation=queued_prompt_generation,
+        turn_metadata=turn_metadata,
     )
 
     def _complete(done: dict) -> None:
@@ -7431,6 +7442,7 @@ def _enqueue_prompt(
     text: Any,
     transport: Any,
     image_paths: list[str] | None = None,
+    turn_metadata: dict[str, Any] | None = None,
 ) -> None:
     """Stash a message to run as the very next turn once the live one ends.
 
@@ -7445,6 +7457,8 @@ def _enqueue_prompt(
     queued = {"text": text, "transport": transport}
     if image_paths:
         queued["image_paths"] = image_paths
+    if turn_metadata:
+        queued["turn_metadata"] = copy.deepcopy(turn_metadata)
     existing = session.get("queued_prompt")
     if (
         existing
@@ -7452,6 +7466,7 @@ def _enqueue_prompt(
         and isinstance(text, str)
         and not existing.get("image_paths")
         and not image_paths
+        and (existing.get("turn_metadata") or {}) == (turn_metadata or {})
         and not session.get("queued_prompts")
     ):
         prev = existing["text"]
@@ -7499,7 +7514,13 @@ def _interrupt_busy_session(sid: str, session: dict, agent: Any) -> None:
 
 
 def _handle_busy_submit(
-    rid, sid: str, session: dict, text: Any, transport: Any, queued: bool = False
+    rid,
+    sid: str,
+    session: dict,
+    text: Any,
+    transport: Any,
+    queued: bool = False,
+    turn_metadata: dict[str, Any] | None = None,
 ) -> dict | None:
     """Apply the ``display.busy_input_mode`` policy to a prompt that lands while
     a turn is in flight, instead of rejecting it with ``session busy``.
@@ -7537,7 +7558,14 @@ def _handle_busy_submit(
             session["attached_images"] = []
     text_only = not image_paths and _is_text_only_busy_payload(text)
     plain_text = _coerce_message_text(text).strip() if text_only else ""
-    if mode == "steer" and text_only and plain_text and agent is not None and hasattr(agent, "steer"):
+    if (
+        mode == "steer"
+        and not turn_metadata
+        and text_only
+        and plain_text
+        and agent is not None
+        and hasattr(agent, "steer")
+    ):
         try:
             if agent.steer(plain_text):
                 with session["history_lock"]:
@@ -7550,6 +7578,7 @@ def _handle_busy_submit(
     # the proven interrupt + queue path below.
     if (
         mode == "interrupt"
+        and not turn_metadata
         and text_only
         and plain_text
         and agent is not None
@@ -7572,7 +7601,13 @@ def _handle_busy_submit(
             if image_paths:
                 session["attached_images"] = image_paths + list(session.get("attached_images", []))
             return None
-        _enqueue_prompt(session, text, transport, image_paths=image_paths)
+        _enqueue_prompt(
+            session,
+            text,
+            transport,
+            image_paths=image_paths,
+            turn_metadata=turn_metadata,
+        )
         session["last_active"] = time.time()
 
     # Attachments need a separate model invocation. Queue them without
@@ -7607,6 +7642,11 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
             session["running"] = False
             return True
     dispatch_failed = False
+    turn_kwargs = (
+        {"turn_metadata": queued["turn_metadata"]}
+        if queued.get("turn_metadata")
+        else {}
+    )
     try:
         if use_compute_host:
             if queued.get("image_paths"):
@@ -7617,10 +7657,16 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
                     queued["text"],
                     image_paths=queued["image_paths"],
                     queued_prompt_generation=queue_generation,
+                    **turn_kwargs,
                 )
             else:
                 resp = _submit_prompt_to_compute_host(
-                    rid, sid, session, queued["text"], queued_prompt_generation=queue_generation
+                    rid,
+                    sid,
+                    session,
+                    queued["text"],
+                    queued_prompt_generation=queue_generation,
+                    **turn_kwargs,
                 )
             if resp.get("error"):
                 message = str(((resp.get("error") or {}).get("message")) or "queued prompt failed")
@@ -7638,6 +7684,7 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
                     queued["text"],
                     image_paths=queued["image_paths"],
                     queued_prompt_generation=queue_generation,
+                    **turn_kwargs,
                 )
             else:
                 _run_prompt_submit(
@@ -7646,6 +7693,7 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
                     session,
                     queued["text"],
                     queued_prompt_generation=queue_generation,
+                    **turn_kwargs,
                 )
     except Exception as exc:
         print(
@@ -9489,6 +9537,7 @@ def _run_prompt_submit(
     display_metadata: dict | None = None,
     image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
+    turn_metadata: dict[str, Any] | None = None,
 ) -> None:
     with session["history_lock"]:
         if (
@@ -9546,6 +9595,7 @@ def _run_prompt_submit(
         marker_text = session.pop("_auto_continue_prompt", None) or text
         if isinstance(marker_text, str) and marker_text.strip():
             record_turn_start(marker_home, marker_key, marker_text, attempts=marker_attempt)
+        turn_metadata_token = _bind_turn_metadata(turn_metadata)
         try:
             from tools.approval import (
                 reset_current_session_key,
@@ -10185,6 +10235,7 @@ def _run_prompt_submit(
                 )
                 _emit("error", sid, {"message": str(e)})
         finally:
+            _reset_turn_metadata(turn_metadata_token)
             # Drop both local snapshots of the pre-turn history before asking
             # glibc to return pages. session["history"] already points at the
             # new/pruned result; retaining either list defeats this trim.

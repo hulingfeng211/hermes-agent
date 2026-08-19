@@ -412,7 +412,7 @@ def _allows_private_ip_resolution(hostname: str, scheme: str) -> bool:
     return scheme == "https" and hostname in _TRUSTED_PRIVATE_IP_HOSTS
 
 
-def is_safe_url(url: str) -> bool:
+def is_safe_url(url: str, *, allow_private_urls: Optional[bool] = None) -> bool:
     """Return True if the URL target is not a private/internal address.
 
     Resolves the hostname to an IP and checks against private ranges.
@@ -439,7 +439,11 @@ def is_safe_url(url: str) -> bool:
             return False
 
         # Check the global toggle AFTER blocking metadata hostnames
-        allow_all_private = _global_allow_private_urls()
+        allow_all_private = (
+            _global_allow_private_urls()
+            if allow_private_urls is None
+            else bool(allow_private_urls)
+        )
 
         allow_private_ip = _allows_private_ip_resolution(hostname, scheme)
 
@@ -536,7 +540,13 @@ def _safe_connect_scheme(host: str, port: int, schemes_by_origin: dict[tuple[str
     return schemes_by_origin.get((host, port)) or ("https" if port == 443 else "http")
 
 
-def _resolved_http_connect_ips(host: str, port: int, scheme: str) -> list[str]:
+def _resolved_http_connect_ips(
+    host: str,
+    port: int,
+    scheme: str,
+    *,
+    allow_private_urls: Optional[bool] = None,
+) -> list[str]:
     """Resolve and validate *host* for one HTTP connect attempt.
 
     Unlike :func:`is_safe_url`, this is called from the HTTP transport at the
@@ -551,7 +561,11 @@ def _resolved_http_connect_ips(host: str, port: int, scheme: str) -> list[str]:
     if hostname in _BLOCKED_HOSTNAMES:
         raise SSRFConnectionBlocked(f"Blocked request to internal hostname: {hostname}")
 
-    allow_all_private = _global_allow_private_urls()
+    allow_all_private = (
+        _global_allow_private_urls()
+        if allow_private_urls is None
+        else bool(allow_private_urls)
+    )
     allow_private_ip = _allows_private_ip_resolution(hostname, scheme)
 
     try:
@@ -596,11 +610,16 @@ def _resolved_http_connect_ips(host: str, port: int, scheme: str) -> list[str]:
 
 
 class _SSRFGuardedAsyncNetworkBackend:
-    def __init__(self, schemes_by_origin_var: Any):
+    def __init__(
+        self,
+        schemes_by_origin_var: Any,
+        allow_private_urls: Optional[bool] = None,
+    ):
         from httpcore._backends.auto import AutoBackend
 
         self._backend = AutoBackend()
         self._schemes_by_origin_var = schemes_by_origin_var
+        self._allow_private_urls = allow_private_urls
 
     async def connect_tcp(
         self,
@@ -614,7 +633,13 @@ class _SSRFGuardedAsyncNetworkBackend:
 
         schemes_by_origin = self._schemes_by_origin_var.get({})
         scheme = _safe_connect_scheme(host, port, schemes_by_origin)
-        ips = await asyncio.to_thread(_resolved_http_connect_ips, host, port, scheme)
+        ips = await asyncio.to_thread(
+            _resolved_http_connect_ips,
+            host,
+            port,
+            scheme,
+            allow_private_urls=self._allow_private_urls,
+        )
 
         last_exc: Exception | None = None
         for ip in ips:
@@ -646,11 +671,16 @@ class _SSRFGuardedAsyncNetworkBackend:
 
 
 class _SSRFGuardedNetworkBackend:
-    def __init__(self, schemes_by_origin_var: Any):
+    def __init__(
+        self,
+        schemes_by_origin_var: Any,
+        allow_private_urls: Optional[bool] = None,
+    ):
         from httpcore._backends.sync import SyncBackend
 
         self._backend = SyncBackend()
         self._schemes_by_origin_var = schemes_by_origin_var
+        self._allow_private_urls = allow_private_urls
 
     def connect_tcp(
         self,
@@ -664,7 +694,12 @@ class _SSRFGuardedNetworkBackend:
 
         schemes_by_origin = self._schemes_by_origin_var.get({})
         scheme = _safe_connect_scheme(host, port, schemes_by_origin)
-        ips = _resolved_http_connect_ips(host, port, scheme)
+        ips = _resolved_http_connect_ips(
+            host,
+            port,
+            scheme,
+            allow_private_urls=self._allow_private_urls,
+        )
 
         last_exc: Exception | None = None
         for ip in ips:
@@ -704,7 +739,9 @@ def _origin_scheme_context(request: Any) -> dict[tuple[str, int], str]:
     return {(host, port): scheme}
 
 
-def ssrf_safe_async_http_transport(**kwargs: Any) -> Any:
+def ssrf_safe_async_http_transport(
+    *, allow_private_urls: Optional[bool] = None, **kwargs: Any
+) -> Any:
     """Return an httpx async transport that pins direct TCP connects to vetted IPs."""
     import contextvars
     import httpx
@@ -715,7 +752,8 @@ def ssrf_safe_async_http_transport(**kwargs: Any) -> Any:
         def __init__(self, **transport_kwargs: Any):
             super().__init__(**transport_kwargs)
             self._pool._network_backend = _SSRFGuardedAsyncNetworkBackend(  # type: ignore[attr-defined]
-                schemes_by_origin_var
+                schemes_by_origin_var,
+                allow_private_urls,
             )
 
         async def handle_async_request(self, request: Any) -> Any:
@@ -728,7 +766,9 @@ def ssrf_safe_async_http_transport(**kwargs: Any) -> Any:
     return _Transport(**kwargs)
 
 
-def ssrf_safe_http_transport(**kwargs: Any) -> Any:
+def ssrf_safe_http_transport(
+    *, allow_private_urls: Optional[bool] = None, **kwargs: Any
+) -> Any:
     """Return an httpx sync transport that pins direct TCP connects to vetted IPs."""
     import contextvars
     import httpx
@@ -739,7 +779,8 @@ def ssrf_safe_http_transport(**kwargs: Any) -> Any:
         def __init__(self, **transport_kwargs: Any):
             super().__init__(**transport_kwargs)
             self._pool._network_backend = _SSRFGuardedNetworkBackend(  # type: ignore[attr-defined]
-                schemes_by_origin_var
+                schemes_by_origin_var,
+                allow_private_urls,
             )
 
         def handle_request(self, request: Any) -> Any:
@@ -752,7 +793,11 @@ def ssrf_safe_http_transport(**kwargs: Any) -> Any:
     return _Transport(**kwargs)
 
 
-def _install_ssrf_guard_on_async_transport(transport: Any, schemes_by_origin_var: Any) -> None:
+def _install_ssrf_guard_on_async_transport(
+    transport: Any,
+    schemes_by_origin_var: Any,
+    allow_private_urls: Optional[bool] = None,
+) -> None:
     state = getattr(transport, "__dict__", {}) if transport is not None else {}
     if transport is None or state.get("_hermes_ssrf_guarded", False):
         return
@@ -760,7 +805,10 @@ def _install_ssrf_guard_on_async_transport(transport: Any, schemes_by_origin_var
     pool = state.get("_pool")
     if pool is None or not hasattr(pool, "_network_backend"):
         raise SSRFConnectionBlocked("Unsupported async httpx transport cannot be made SSRF-safe")
-    pool._network_backend = _SSRFGuardedAsyncNetworkBackend(schemes_by_origin_var)
+    pool._network_backend = _SSRFGuardedAsyncNetworkBackend(
+        schemes_by_origin_var,
+        allow_private_urls,
+    )
 
     handle_async_request = getattr(transport, "handle_async_request", None)
     if handle_async_request is None:
@@ -777,7 +825,11 @@ def _install_ssrf_guard_on_async_transport(transport: Any, schemes_by_origin_var
     transport._hermes_ssrf_guarded = True
 
 
-def _install_ssrf_guard_on_transport(transport: Any, schemes_by_origin_var: Any) -> None:
+def _install_ssrf_guard_on_transport(
+    transport: Any,
+    schemes_by_origin_var: Any,
+    allow_private_urls: Optional[bool] = None,
+) -> None:
     state = getattr(transport, "__dict__", {}) if transport is not None else {}
     if transport is None or state.get("_hermes_ssrf_guarded", False):
         return
@@ -785,7 +837,10 @@ def _install_ssrf_guard_on_transport(transport: Any, schemes_by_origin_var: Any)
     pool = state.get("_pool")
     if pool is None or not hasattr(pool, "_network_backend"):
         raise SSRFConnectionBlocked("Unsupported httpx transport cannot be made SSRF-safe")
-    pool._network_backend = _SSRFGuardedNetworkBackend(schemes_by_origin_var)
+    pool._network_backend = _SSRFGuardedNetworkBackend(
+        schemes_by_origin_var,
+        allow_private_urls,
+    )
 
     handle_request = getattr(transport, "handle_request", None)
     if handle_request is None:
@@ -802,27 +857,33 @@ def _install_ssrf_guard_on_transport(transport: Any, schemes_by_origin_var: Any)
     transport._hermes_ssrf_guarded = True
 
 
-def _install_ssrf_guard_on_async_client(client: Any) -> None:
+def _install_ssrf_guard_on_async_client(
+    client: Any, allow_private_urls: Optional[bool] = None
+) -> None:
     import contextvars
 
     schemes_by_origin_var = contextvars.ContextVar("hermes_ssrf_async_origin_schemes")
     state = getattr(client, "__dict__", {})
     _install_ssrf_guard_on_async_transport(
-        state.get("_transport"), schemes_by_origin_var
+        state.get("_transport"), schemes_by_origin_var, allow_private_urls
     )
 
 
-def _install_ssrf_guard_on_client(client: Any) -> None:
+def _install_ssrf_guard_on_client(
+    client: Any, allow_private_urls: Optional[bool] = None
+) -> None:
     import contextvars
 
     schemes_by_origin_var = contextvars.ContextVar("hermes_ssrf_origin_schemes")
     state = getattr(client, "__dict__", {})
     _install_ssrf_guard_on_transport(
-        state.get("_transport"), schemes_by_origin_var
+        state.get("_transport"), schemes_by_origin_var, allow_private_urls
     )
 
 
-def create_ssrf_safe_async_client(**kwargs: Any) -> Any:
+def create_ssrf_safe_async_client(
+    *, allow_private_urls: Optional[bool] = None, **kwargs: Any
+) -> Any:
     """Create an ``httpx.AsyncClient`` with connect-time SSRF validation.
 
     Direct HTTP(S) connections are resolved, validated, and dialed by IP at
@@ -834,16 +895,18 @@ def create_ssrf_safe_async_client(**kwargs: Any) -> Any:
     import httpx
 
     client = httpx.AsyncClient(**kwargs)
-    _install_ssrf_guard_on_async_client(client)
+    _install_ssrf_guard_on_async_client(client, allow_private_urls)
     return client
 
 
-def create_ssrf_safe_client(**kwargs: Any) -> Any:
+def create_ssrf_safe_client(
+    *, allow_private_urls: Optional[bool] = None, **kwargs: Any
+) -> Any:
     """Create an ``httpx.Client`` with connect-time SSRF validation."""
     import httpx
 
     client = httpx.Client(**kwargs)
-    _install_ssrf_guard_on_client(client)
+    _install_ssrf_guard_on_client(client, allow_private_urls)
     return client
 
 

@@ -1,7 +1,9 @@
 """Tests for tools/skills_hub.py — source adapters, lock file, taps, dedup logic."""
 
 import json
+import threading
 import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import List, Optional
 from unittest.mock import patch, MagicMock
 
@@ -9,6 +11,7 @@ import httpx
 import pytest
 
 from tools.skills_hub import (
+    EnterpriseSkillSource,
     GitHubAuth,
     GitHubSource,
     LobeHubSource,
@@ -24,6 +27,7 @@ from tools.skills_hub import (
     bundle_content_hash,
     check_for_skill_updates,
     create_source_router,
+    normalize_enterprise_source_config,
     parallel_search_sources,
     unified_search,
     append_audit_log,
@@ -1551,6 +1555,195 @@ class TestParallelSearchSourcesTimeout:
         assert source_counts.get("a") == 1
         assert source_counts.get("b") == 1
         assert len(all_results) == 2
+
+
+# ---------------------------------------------------------------------------
+# Enterprise configured source
+# ---------------------------------------------------------------------------
+
+
+class TestEnterpriseSkillSource:
+    @staticmethod
+    def _config(**overrides):
+        return {
+            "id": "corp",
+            "label": "Corporate Hub",
+            "index_url": "http://skills.corp",
+            "token_env": "",
+            "allow_private_network": True,
+            "ca_bundle": "",
+            **overrides,
+        }
+
+    def test_normalizes_base_url_to_well_known_index(self):
+        config = normalize_enterprise_source_config(self._config())
+        assert config["index_url"] == (
+            "http://skills.corp/.well-known/skills/index.json"
+        )
+
+    def test_search_and_fetch_use_stable_enterprise_identity(self, monkeypatch, tmp_path):
+        import tools.skills_hub as hub
+
+        monkeypatch.setattr(hub, "_index_cache_dir", lambda: tmp_path / "cache")
+        monkeypatch.setattr(hub, "_hub_dir", lambda: tmp_path / "hub")
+        source = EnterpriseSkillSource(self._config())
+
+        index_response = MagicMock(status_code=200)
+        index_response.json.return_value = {
+            "skills": [
+                {
+                    "name": "deploy-helper",
+                    "description": "Internal deployment workflow",
+                    "files": ["SKILL.md", "references/runbook.md"],
+                }
+            ]
+        }
+        skill_response = MagicMock(status_code=200, text="---\nname: deploy-helper\n---\n")
+        ref_response = MagicMock(status_code=200, text="runbook")
+        monkeypatch.setattr(
+            source,
+            "_request",
+            MagicMock(side_effect=[index_response, skill_response, ref_response]),
+        )
+
+        results = source.search("deployment")
+        assert [result.identifier for result in results] == [
+            "enterprise:corp/deploy-helper"
+        ]
+        assert results[0].source == "enterprise:corp"
+
+        bundle = source.fetch("enterprise:corp/deploy-helper")
+        assert bundle is not None
+        assert bundle.source == "enterprise:corp"
+        assert bundle.files["references/runbook.md"] == "runbook"
+
+    def test_real_private_http_source_search_and_fetch(self, monkeypatch, tmp_path):
+        import hermes_cli.config as hermes_config
+        import tools.skills_hub as hub
+
+        requests = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                requests.append((self.path, self.headers.get("Authorization")))
+                payloads = {
+                    "/.well-known/skills/index.json": json.dumps(
+                        {
+                            "skills": [
+                                {
+                                    "name": "deploy-helper",
+                                    "description": "Internal deployment workflow",
+                                    "files": ["SKILL.md", "references/runbook.md"],
+                                }
+                            ]
+                        }
+                    ),
+                    "/.well-known/skills/deploy-helper/SKILL.md": (
+                        "---\nname: deploy-helper\n---\n\n# Deploy helper\n"
+                    ),
+                    "/.well-known/skills/deploy-helper/references/runbook.md": "runbook",
+                }
+                payload = payloads.get(self.path)
+                if payload is None:
+                    self.send_error(404)
+                    return
+                body = payload.encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json" if self.path.endswith(".json") else "text/plain")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, _format, *args):
+                return
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            monkeypatch.setattr(hub, "_index_cache_dir", lambda: tmp_path / "cache")
+            monkeypatch.setattr(hub, "_hub_dir", lambda: tmp_path / "hub")
+            monkeypatch.setattr(
+                hermes_config,
+                "get_env_value",
+                lambda name: "internal-token" if name == "CORP_SKILLHUB_TOKEN" else None,
+            )
+            source = EnterpriseSkillSource(
+                self._config(
+                    index_url=f"http://127.0.0.1:{server.server_port}",
+                    token_env="CORP_SKILLHUB_TOKEN",
+                )
+            )
+
+            results = source.search("deployment")
+            bundle = source.fetch("enterprise:corp/deploy-helper")
+
+            assert [result.identifier for result in results] == [
+                "enterprise:corp/deploy-helper"
+            ]
+            assert bundle is not None
+            assert bundle.files["references/runbook.md"] == "runbook"
+            assert [path for path, _token in requests] == [
+                "/.well-known/skills/index.json",
+                "/.well-known/skills/deploy-helper/SKILL.md",
+                "/.well-known/skills/deploy-helper/references/runbook.md",
+            ]
+            assert all(token == "Bearer internal-token" for _path, token in requests)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+    def test_cross_origin_redirect_is_blocked(self, monkeypatch):
+        import tools.skills_hub as hub
+
+        source = EnterpriseSkillSource(self._config())
+        redirect = MagicMock(
+            status_code=302,
+            headers={"location": "http://outside.example/index.json"},
+        )
+        fetch = MagicMock(return_value=redirect)
+        monkeypatch.setattr(hub, "is_safe_url", lambda *_args, **_kwargs: True)
+        monkeypatch.setattr(hub, "check_website_access", lambda _url: None)
+        monkeypatch.setattr(hub, "_ssrf_safe_http_get", fetch)
+
+        assert source._request(source.index_url) is None
+        assert fetch.call_count == 1
+
+    def test_network_failure_uses_stale_index(self, monkeypatch, tmp_path):
+        import os
+        import tools.skills_hub as hub
+
+        monkeypatch.setattr(hub, "_index_cache_dir", lambda: tmp_path / "cache")
+        monkeypatch.setattr(hub, "_hub_dir", lambda: tmp_path / "hub")
+        source = EnterpriseSkillSource(self._config())
+        cache_file = source._cache_file()
+        cache_file.parent.mkdir(parents=True)
+        cache_file.write_text(
+            json.dumps({"skills": [{"name": "cached-skill", "description": "Cached"}]}),
+            encoding="utf-8",
+        )
+        stale = time.time() - 7200
+        os.utime(cache_file, (stale, stale))
+        monkeypatch.setattr(source, "_request", lambda _url: None)
+
+        assert [item.name for item in source.search("cached")] == ["cached-skill"]
+        assert source.status == "cached"
+        assert source.last_error == "unreachable"
+
+    def test_private_router_contains_no_public_adapters(self, monkeypatch):
+        import tools.skills_hub as hub
+
+        monkeypatch.setattr(
+            hub,
+            "load_skills_hub_config",
+            lambda: {"mode": "private", "sources": [self._config()]},
+        )
+        source_ids = [source.source_id() for source in create_source_router()]
+
+        assert source_ids == ["official", "enterprise:corp"]
+        assert "hermes-index" not in source_ids
+        assert "github" not in source_ids
 
 
 # ---------------------------------------------------------------------------

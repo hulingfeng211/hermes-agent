@@ -1,6 +1,14 @@
 import { describe, expect, it } from 'vitest'
 
-import { NEW_CHAT_ROUTE, primaryRouteSelectedSessionId, sessionRoute, SETTINGS_ROUTE } from './routes'
+import { registerPluginLocales } from '@/i18n'
+
+import {
+  NEW_CHAT_ROUTE,
+  primaryRouteSelectedSessionId,
+  sessionRoute,
+  SETTINGS_ROUTE,
+  sidebarNavContributionLabel
+} from './routes'
 
 const SESS_A = 'sess-a'
 const SESS_B = 'sess-b'
@@ -26,5 +34,36 @@ describe('primaryRouteSelectedSessionId', () => {
 
   it('returns null on a non-chat route with no store selection', () => {
     expect(primaryRouteSelectedSessionId(SETTINGS_ROUTE, null)).toBeNull()
+  })
+})
+
+describe('sidebarNavContributionLabel', () => {
+  it('resolves a plugin-owned label key against the active locale', () => {
+    const dispose = registerPluginLocales('nav-test', {
+      en: { navLabel: 'Knowledge Base' },
+      zh: { navLabel: '知识库' }
+    })
+
+    try {
+      expect(
+        sidebarNavContributionLabel(
+          { source: 'plugin:nav-test' },
+          { codicon: 'library', label: 'Knowledge Base', labelKey: 'navLabel', path: '/knowledge' },
+          'zh'
+        )
+      ).toBe('知识库')
+    } finally {
+      dispose()
+    }
+  })
+
+  it('uses the plain label when the localized key is unavailable', () => {
+    expect(
+      sidebarNavContributionLabel(
+        { source: 'plugin:missing' },
+        { codicon: 'library', label: 'Knowledge Base', labelKey: 'navLabel', path: '/knowledge' },
+        'zh'
+      )
+    ).toBe('Knowledge Base')
   })
 })

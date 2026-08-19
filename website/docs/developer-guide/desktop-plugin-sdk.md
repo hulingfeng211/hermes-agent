@@ -260,13 +260,15 @@ ctx.registerMany([
   {
     id: 'nav',
     area: SIDEBAR_NAV_AREA,
-    data: { path: '/my-page', label: 'My Page', codicon: 'project' }
+    data: { path: '/my-page', label: 'My Page', labelKey: 'navLabel', codicon: 'project' }
   }
 ])
 ```
 
 `codicon` is a [VS Code codicon](https://microsoft.github.io/vscode-codicons/dist/codicon.html)
-id. Navigate to a route from anywhere with `host.navigate('/my-page')`.
+id. `label` is the fallback shown on older hosts; when `labelKey` is present,
+Desktop resolves it reactively from this plugin's `ctx.i18n` bundle. Navigate to
+a route from anywhere with `host.navigate('/my-page')`.
 
 ### Status bar and title bar
 
@@ -336,7 +338,82 @@ ctx.register({ id: 'noir', area: THEMES_AREA, data: myDesktopTheme })
 `COMPOSER_AREAS` (`top`, `bottom`, `leading`, `actions`, `attachments`,
 `middleware`) let a plugin add controls around the message composer, provide an
 attachment source, or transform a draft before it is sent (`ComposerMiddleware`
-with a `handler(draft) => draft | null`).
+with a `handler(draft, context) => draft | { draft, onCommit? } | null`). A raw
+draft preserves the original transform-only API; `null` cancels the operation.
+The immutable context belongs to the exact ChatBar performing the submission:
+
+```ts
+interface ComposerContextValue {
+  runtimeSessionId: string | null
+  storedSessionId: string | null
+}
+```
+
+`storedSessionId` is the composer's durable queue/session key (including
+lineage-root resolution); use it for persisted per-conversation intent.
+`runtimeSessionId` identifies the live gateway stream. Render contributions can
+read the same scoped value with `useComposerContext()`. Do not substitute
+`host.state.activeSessionId`: a background tile or queued session can submit
+while a different conversation is globally active.
+
+A middleware may attach bounded, JSON-safe data to one new turn through
+`draft.turnMetadata`. Top-level keys are plugin namespaces. When a plugin also
+has one-shot UI state, return `{ draft, onCommit }`: keep `handler` as a pure
+preparation step and consume that state only in `onCommit`.
+
+Hermes snapshots metadata with the submitted or queued message, transports it
+as `turn_metadata`, and exposes it to backend plugins only while that turn
+runs. It is not conversation state and is never added to the visible message,
+persisted transcript, system prompt, or provider request:
+
+```javascript
+ctx.register({
+  id: 'strict-review-intent',
+  area: COMPOSER_AREAS.middleware,
+  data: {
+    handler(draft, context) {
+      const intent = readPendingIntent(context.storedSessionId)
+
+      if (!intent) return draft
+
+      return {
+        draft: {
+          ...draft,
+          turnMetadata: {
+            ...draft.turnMetadata,
+            'acme.review': { mode: intent.mode }
+          }
+        },
+        onCommit: () => clearPendingIntent(context.storedSessionId, intent.id)
+      }
+    }
+  }
+})
+```
+
+The gateway validates the same limits authoritatively: at most 16 KiB, 32
+namespaces, 256 JSON values, and eight nesting levels. Namespace keys use
+up to 64 characters and match
+`[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*`. Metadata-bearing submissions are new turns
+only; they are queued rather than redirected into an active turn, and steering
+never carries turn metadata.
+
+`onCommit` is an admission receipt, not a send-success callback. Hermes invokes
+the aggregated callbacks once, in middleware order:
+
+- after a queued entry is successfully inserted (including a rejected redirect
+  that falls back to the queue); or
+- immediately before the first real `prompt.submit` request for a typed, voice,
+  external, or model-producing slash turn.
+
+The receipt remains consumed if the host rejects that request, so one-shot state
+cannot leak into the next turn. Retry/resume paths do not invoke it again.
+Callbacks are renderer-local and are never serialized into the queue; a queued
+turn commits at admission, then foreground/background drain only the prepared
+metadata snapshot. A local or backend-only slash command, malformed slash,
+middleware cancellation, Stop/cancel, or accepted steering does not commit.
+Callback failures are isolated and cannot undo admission or block later
+callbacks.
 
 ### Mount-scoped chrome (`Contribute`)
 
@@ -617,8 +694,8 @@ not treat this pipeline as a trust boundary.
 | Host | `host` (`.state.*`, `.notify`, `.notifyError`, `.navigate`, `.onEvent`, `.logs`, `.status`, `.restartGateway`, `.request`) |
 | Plugin contract | `HermesPlugin`, `PluginContext`, `PluginContribution`, `PluginStorage`, `PluginOs`, `PluginRestOptions`, `PluginNativeNotificationInput`, `Contribution` |
 | Area constants | `PANES_AREA`, `ROUTES_AREA`, `SIDEBAR_NAV_AREA`, `STATUSBAR_AREAS`, `TITLEBAR_AREAS`, `PALETTE_AREA`, `KEYBINDS_AREA`, `THEMES_AREA`, `COMPOSER_AREAS` |
-| Area payloads | `RouteContribution`, `SidebarNavContribution`, `StatusbarItem`, `TitlebarTool`, `PaletteContribution`, `KeybindContribution`, `ComposerMiddleware`, `ComposerAttachmentProvider` |
-| React / state | `useValue`, `atom`, `computed`, `useQuery`, `useMutation`, `useQueryClient`, `queryClient`, `Contribute` |
+| Area payloads | `RouteContribution`, `SidebarNavContribution`, `StatusbarItem`, `TitlebarTool`, `PaletteContribution`, `KeybindContribution`, `ComposerDraft`, `ComposerContextValue`, `ComposerMiddleware`, `ComposerMiddlewareOutput`, `ComposerMiddlewareResult`, `ComposerAttachmentProvider`, `TurnMetadata` |
+| React / state | `useValue`, `atom`, `computed`, `useQuery`, `useMutation`, `useQueryClient`, `queryClient`, `useComposerContext`, `Contribute` |
 | UI kit | `Button`, `Input`, `Textarea`, `Select*`, `Switch`, `Checkbox`, `SegmentedControl`, `Tabs*`, `Dialog*`, `ConfirmDialog`, `DropdownMenu*`, `ContextMenu*`, `Popover*`, `Tip`/`Tooltip*`, `Badge`, `Kbd`/`KbdGroup`, `SearchField`, `ScrollArea`, `Separator`, `Skeleton`, `GlyphSpinner`, `Loader`, `EmptyState`, `ErrorState`, `CopyButton`, `StatusDot`, `LogView`, `Codicon`, `DecodeText` |
 | Helpers | `cn`, `icons`, `haptic`, `useI18n`, `profileColor`, `profileColorSoft`, `relativeTime`, `fmtDateTime`, `fmtDayTime`, `coarseElapsed`, `evaluateRuntimeReadiness` |
 

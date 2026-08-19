@@ -577,7 +577,12 @@ export function usePromptActions({
         triggerHaptic('selection')
         // Forward the explicit target (background queue drain, tile) — dropping
         // it ran the command against whatever chat happened to be in front.
-        await executeSlashCommand(visibleText, options?.sessionId ? { sessionId: options.sessionId } : undefined)
+        await executeSlashCommand(visibleText, {
+          ...(options?.sessionId ? { sessionId: options.sessionId } : {}),
+          ...(options?.turnMetadata ? { turnMetadata: options.turnMetadata } : {}),
+          ...(options?.composerPrepared ? { composerPrepared: true } : {}),
+          ...(options?.commitComposerAdmission ? { commitComposerAdmission: options.commitComposerAdmission } : {})
+        })
 
         return true
       }

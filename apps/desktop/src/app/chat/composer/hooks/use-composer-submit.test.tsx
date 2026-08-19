@@ -5,12 +5,15 @@ import { $clarifyRequests } from '@/store/clarify'
 import type { ComposerAttachment } from '@/store/composer'
 import { $gateway } from '@/store/gateway'
 
+import { requestComposerSubmit } from '../focus'
+
 import { useComposerSubmit } from './use-composer-submit'
 
 interface SubmitHarnessOptions {
   attachments?: ComposerAttachment[]
   busy?: boolean
   compacting?: boolean
+  steerAccepted?: boolean
   text?: string
 }
 
@@ -18,6 +21,7 @@ function renderSubmitHook({
   attachments = [],
   busy = false,
   compacting = false,
+  steerAccepted = true,
   text = ''
 }: SubmitHarnessOptions = {}) {
   const draftRef = { current: text }
@@ -26,7 +30,7 @@ function renderSubmitHook({
   editor.textContent = text
   const editorRef = { current: editor }
   const onCancel = vi.fn()
-  const onSteer = vi.fn(async () => true)
+  const onSteer = vi.fn(async () => steerAccepted)
   const onSubmit = vi.fn(async () => true)
   const queueCurrentDraft = vi.fn(() => true)
 
@@ -84,6 +88,28 @@ describe('useComposerSubmit busy-turn routing', () => {
 
     await waitFor(() => expect(onSteer).toHaveBeenCalledWith('change course'))
     expect(queueCurrentDraft).not.toHaveBeenCalled()
+    expect(onCancel).not.toHaveBeenCalled()
+    expect(onSubmit).not.toHaveBeenCalled()
+  })
+
+  it('admits a rejected steer fallback through the new-turn queue path', async () => {
+    const { hook, onCancel, onSteer, onSubmit, queueCurrentDraft } = renderSubmitHook({
+      busy: true,
+      steerAccepted: false,
+      text: 'keep this as the next turn'
+    })
+
+    act(() => {
+      hook.result.current.submitDraft()
+    })
+
+    await waitFor(() =>
+      expect(queueCurrentDraft).toHaveBeenCalledWith({
+        attachments: [],
+        text: 'keep this as the next turn'
+      })
+    )
+    expect(onSteer).toHaveBeenCalledWith('keep this as the next turn')
     expect(onCancel).not.toHaveBeenCalled()
     expect(onSubmit).not.toHaveBeenCalled()
   })
@@ -183,6 +209,18 @@ describe('useComposerSubmit busy-turn routing', () => {
 
     await waitFor(() =>
       expect(onSubmit).toHaveBeenCalledWith('hello', expect.objectContaining({ composerScope: 'stored-session' }))
+    )
+  })
+
+  it('routes an external submit request through the same composer submit callback', async () => {
+    const { onSubmit } = renderSubmitHook()
+
+    act(() => {
+      requestComposerSubmit('ship the review changes', { target: 'main' })
+    })
+
+    await waitFor(() =>
+      expect(onSubmit).toHaveBeenCalledWith('ship the review changes', { composerScope: 'stored-session' })
     )
   })
 })

@@ -321,6 +321,29 @@ class ComputeHost:
 
     def _handle_turn_start(self, frame: dict[str, Any]) -> None:
         sid = str(frame.get("sid") or "")
+        try:
+            from hermes_cli.turn_context import normalize_turn_metadata
+
+            turn_metadata = (
+                normalize_turn_metadata(frame["turn_metadata"])
+                if "turn_metadata" in frame
+                else {}
+            )
+        except ValueError as exc:
+            self.emit(
+                {
+                    "type": "turn.error",
+                    "sid": sid,
+                    "request_id": frame.get("request_id"),
+                    "message": str(exc),
+                }
+            )
+            return
+        frame = dict(frame)
+        if turn_metadata:
+            frame["turn_metadata"] = turn_metadata
+        else:
+            frame.pop("turn_metadata", None)
         if sid in self._sessions:
             self._handle_spike_turn_start(frame)
             return
@@ -484,7 +507,16 @@ class ComputeHost:
             except Exception:
                 pass
             text = frame.get("text") if "text" in frame else frame.get("prompt", "")
-            server._run_prompt_submit(request_id, sid, session, text)
+            if frame.get("turn_metadata"):
+                server._run_prompt_submit(
+                    request_id,
+                    sid,
+                    session,
+                    text,
+                    turn_metadata=frame["turn_metadata"],
+                )
+            else:
+                server._run_prompt_submit(request_id, sid, session, text)
             run_thread = session.get("_run_thread")
             if run_thread is not None and hasattr(run_thread, "join"):
                 run_thread.join()

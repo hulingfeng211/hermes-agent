@@ -30,25 +30,7 @@ def build_skills_parser(subparsers, *, cmd_skills: Callable) -> None:
     skills_browse.add_argument(
         "--source",
         default="all",
-        choices=[
-            "all",
-            "official",
-            "skills-sh",
-            "well-known",
-            "github",
-            "clawhub",
-            "lobehub",
-            "browse-sh",
-            # Provider filters (GitHub taps stored under source="github"):
-            "nvidia",
-            "openai",
-            "anthropic",
-            "huggingface",
-            "voltagent",
-            "gstack",
-            "minimax",
-        ],
-        help="Filter by source or provider (e.g. nvidia, openai) (default: all)",
+        help="Filter by source id or provider (e.g. enterprise:corp, nvidia) (default: all)",
     )
 
     skills_search = skills_subparsers.add_parser(
@@ -58,25 +40,7 @@ def build_skills_parser(subparsers, *, cmd_skills: Callable) -> None:
     skills_search.add_argument(
         "--source",
         default="all",
-        choices=[
-            "all",
-            "official",
-            "skills-sh",
-            "well-known",
-            "github",
-            "clawhub",
-            "lobehub",
-            "browse-sh",
-            # Provider filters (GitHub taps stored under source="github"):
-            "nvidia",
-            "openai",
-            "anthropic",
-            "huggingface",
-            "voltagent",
-            "gstack",
-            "minimax",
-        ],
-        help="Filter by source or provider (e.g. nvidia, openai)",
+        help="Filter by source id or provider (e.g. enterprise:corp, nvidia)",
     )
     skills_search.add_argument("--limit", type=int, default=25, help="Max results")
     skills_search.add_argument(

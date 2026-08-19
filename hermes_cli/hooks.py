@@ -150,6 +150,9 @@ _DEFAULT_PAYLOADS = {
         "conversation_history": [],
         "is_first_turn": True,
         "model": "gpt-4",
+        "provider": "openai",
+        "base_url": "https://api.openai.com/v1",
+        "api_mode": "chat_completions",
         "platform": "cli",
     },
     "post_llm_call": {

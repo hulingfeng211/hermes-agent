@@ -104,6 +104,7 @@ import {
   MESSAGING_ROUTE,
   SIDEBAR_NAV_AREA,
   type SidebarNavContribution,
+  sidebarNavContributionLabel,
   SKILLS_ROUTE
 } from '../../routes'
 import type { SidebarNavItem } from '../../types'
@@ -256,7 +257,7 @@ export function ChatSidebar({
   onManageCronJob,
   onTriggerCronJob
 }: ChatSidebarProps) {
-  const { t } = useI18n()
+  const { locale, t } = useI18n()
   const s = t.sidebar
   const { pathname } = useLocation()
   // Contributed nav rows (plugins pairing a page with a sidebar entry) render
@@ -267,8 +268,9 @@ export function ChatSidebar({
     () =>
       navContributions.flatMap(c => {
         const data = c.data as Partial<SidebarNavContribution> | undefined
+        const label = data ? sidebarNavContributionLabel(c, data, locale) : null
 
-        if (!data?.path?.startsWith('/') || !data.label) {
+        if (!data?.path?.startsWith('/') || !label) {
           return []
         }
 
@@ -277,13 +279,13 @@ export function ChatSidebar({
         return [
           {
             id: c.id,
-            label: data.label,
+            label,
             icon: (props: { className?: string }) => <Codicon name={codicon} {...props} />,
             route: data.path
           }
         ]
       }),
-    [navContributions]
+    [locale, navContributions]
   )
 
   const panesFlipped = useStore($panesFlipped)

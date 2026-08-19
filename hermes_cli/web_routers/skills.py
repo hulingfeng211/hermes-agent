@@ -23,6 +23,8 @@ from hermes_cli.web_models import (
     SkillContentUpdate,
     SkillCreate,
     SkillInstallRequest,
+    SkillHubConfigUpdate,
+    SkillHubSourceProbeRequest,
     SkillToggle,
     SkillUninstallRequest,
     SkillsUpdateRequest,
@@ -45,6 +47,8 @@ _profile_scope = late("_profile_scope")
 _skill_meta_to_payload = late("_skill_meta_to_payload")
 _spawn_hermes_action = late("_spawn_hermes_action")
 load_config = late("load_config")
+read_raw_config = late("read_raw_config")
+save_config = late("save_config")
 
 # Live proxies for web_server-owned module state (mutations/monkeypatches
 # on web_server remain authoritative; resolved at operation time).
@@ -119,53 +123,80 @@ async def list_skills_hub_sources(profile: Optional[str] = None):
     """
 
     def _run():
-        from tools.skills_hub import create_source_router
+        from tools.skills_hub import create_source_router, load_skills_hub_config
 
         with _config_profile_scope(profile):
             sources = create_source_router()
-        out = []
-        index_available = False
-        featured = []
-        for src in sources:
-            sid = src.source_id()
-            entry = {
-                "id": sid,
-                "label": _SKILL_HUB_SOURCE_LABELS.get(sid, sid),
-            }
-            # GitHub exposes a rate-limit flag; the index an availability flag.
-            if sid == "github":
-                try:
-                    entry["rate_limited"] = bool(getattr(src, "is_rate_limited", False))
-                except Exception:
-                    entry["rate_limited"] = False
-            if sid == "hermes-index":
-                try:
-                    index_available = bool(getattr(src, "is_available", False))
-                except Exception:
-                    index_available = False
-                entry["available"] = index_available
-                # Empty-query search on the index returns featured/popular skills.
-                if index_available:
+            hub_config = load_skills_hub_config()
+            out = []
+            index_available = False
+            featured = []
+            for src in sources:
+                sid = src.source_id()
+                kind = getattr(
+                    src,
+                    "source_kind",
+                    "local" if sid == "official" else "public",
+                )
+                entry = {
+                    "id": sid,
+                    "label": getattr(
+                        src,
+                        "display_name",
+                        _SKILL_HUB_SOURCE_LABELS.get(sid, sid),
+                    ),
+                    "kind": kind,
+                    "configured": bool(getattr(src, "configured", False)),
+                    "removable": bool(getattr(src, "removable", False)),
+                }
+                # GitHub exposes a rate-limit flag; indexes expose availability.
+                if sid == "github":
                     try:
-                        featured = [
-                            _skill_meta_to_payload(m) for m in src.search("", limit=12)
-                        ]
+                        entry["rate_limited"] = bool(getattr(src, "is_rate_limited", False))
                     except Exception:
-                        featured = []
-            out.append(entry)
-        # Tell the UI which sources are worth searching individually (for its
-        # progressive per-source fan-out). Mirror parallel_search_sources: when
-        # the centralized index is available it already subsumes the external
-        # API sources, so they're redundant — skipping them avoids ~70 GitHub
-        # calls per keystroke. Keep this set in sync with that function's
-        # ``_api_source_ids``.
-        _api_source_ids = frozenset(
-            {"github", "skills-sh", "clawhub", "lobehub", "well-known"}
-        )
-        for entry in out:
-            entry["searchable"] = not (index_available and entry["id"] in _api_source_ids)
+                        entry["rate_limited"] = False
+                if sid == "hermes-index":
+                    try:
+                        index_available = bool(getattr(src, "is_available", False))
+                    except Exception:
+                        index_available = False
+                    entry["available"] = index_available
+                    entry["status"] = "online" if index_available else "unreachable"
+                    if index_available:
+                        try:
+                            featured = [
+                                _skill_meta_to_payload(m) for m in src.search("", limit=12)
+                            ]
+                        except Exception:
+                            featured = []
+                elif kind == "enterprise":
+                    try:
+                        entry["available"] = bool(getattr(src, "is_available", False))
+                    except Exception:
+                        entry["available"] = False
+                    entry["status"] = getattr(src, "status", "unreachable")
+                    entry["endpoint"] = getattr(src, "index_url", None)
+                    entry["last_synced_at"] = getattr(src, "last_synced_at", None)
+                    if not featured and entry["available"]:
+                        try:
+                            featured = [
+                                _skill_meta_to_payload(m) for m in src.search("", limit=12)
+                            ]
+                        except Exception:
+                            featured = []
+                out.append(entry)
+            # Tell the UI which sources are worth searching individually (for its
+            # progressive per-source fan-out). Mirror parallel_search_sources.
+            _api_source_ids = frozenset(
+                {"github", "skills-sh", "clawhub", "lobehub", "well-known"}
+            )
+            for entry in out:
+                entry["searchable"] = not (
+                    index_available and entry["id"] in _api_source_ids
+                )
         return {
             "sources": out,
+            "mode": hub_config["mode"],
             "index_available": index_available,
             "featured": featured,
             "installed": _installed_hub_identifiers(profile),
@@ -200,10 +231,10 @@ async def search_skills_hub(
 
         with _config_profile_scope(profile):
             sources = create_source_router()
-        capped = min(max(limit, 1), 50)
-        all_results, source_counts, timed_out = parallel_search_sources(
-            sources, query=query, source_filter=source or "all", overall_timeout=30
-        )
+            capped = min(max(limit, 1), 50)
+            all_results, source_counts, timed_out = parallel_search_sources(
+                sources, query=query, source_filter=source or "all", overall_timeout=30
+            )
 
         # Dedupe by identifier, preferring higher trust (mirrors unified_search).
         _rank = {"builtin": 2, "trusted": 1, "community": 0}
@@ -229,6 +260,72 @@ async def search_skills_hub(
     except Exception as exc:
         _log.exception("skills hub search failed")
         raise HTTPException(status_code=502, detail=f"Hub search failed: {exc}")
+
+
+@hub_router.get("/api/skills/hub/config")
+async def get_skills_hub_config(profile: Optional[str] = None):
+    """Return the profile-scoped enterprise source policy (never secret values)."""
+    from tools.skills_hub import load_skills_hub_config
+
+    with _config_profile_scope(profile):
+        return load_skills_hub_config()
+
+
+@hub_router.put("/api/skills/hub/config")
+async def update_skills_hub_config(
+    body: SkillHubConfigUpdate, profile: Optional[str] = None
+):
+    """Persist enterprise sources without replacing unrelated config keys."""
+    from tools.skills_hub import normalize_enterprise_source_config
+
+    effective_profile = body.profile or profile
+    try:
+        normalized_sources = [
+            normalize_enterprise_source_config(source.model_dump())
+            for source in body.sources
+        ]
+        ids = [source["id"] for source in normalized_sources]
+        if len(ids) != len(set(ids)):
+            raise ValueError("Enterprise Skill Hub source ids must be unique")
+
+        with _config_profile_scope(effective_profile):
+            config = read_raw_config()
+            skills_config = config.get("skills")
+            if not isinstance(skills_config, dict):
+                skills_config = {}
+                config["skills"] = skills_config
+            skills_config["hub"] = {
+                "mode": body.mode,
+                "sources": normalized_sources,
+            }
+            save_config(config)
+        return {"ok": True, "mode": body.mode, "sources": normalized_sources}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except HTTPException:
+        raise
+    except Exception:
+        _log.exception("skills hub config update failed")
+        raise HTTPException(status_code=500, detail="Failed to save Skill Hub configuration")
+
+
+@hub_router.post("/api/skills/hub/sources/test")
+async def test_skills_hub_source(
+    body: SkillHubSourceProbeRequest, profile: Optional[str] = None
+):
+    """Probe one draft enterprise source through the same guarded client."""
+    from tools.skills_hub import EnterpriseSkillSource
+
+    try:
+        with _config_profile_scope(body.profile or profile):
+            source = EnterpriseSkillSource(body.source.model_dump())
+            result = await asyncio.to_thread(source.probe)
+        return result
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception:
+        _log.exception("enterprise Skill Hub source probe failed")
+        raise HTTPException(status_code=502, detail="Enterprise Skill Hub source probe failed")
 
 
 @hub_router.get("/api/skills/hub/preview")

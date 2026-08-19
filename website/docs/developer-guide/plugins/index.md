@@ -662,7 +662,7 @@ Each hook is documented in full on the **[Event Hooks reference](/user-guide/fea
 |------|-----------|-------------------|---------|
 | [`pre_tool_call`](/user-guide/features/hooks#pre_tool_call) | Before any tool executes | `tool_name: str, args: dict, task_id: str` | optional directive: `{"action": "block", "message": ...}` vetoes the call; `{"action": "approve", "message": ...}` escalates to the human-approval gate |
 | [`post_tool_call`](/user-guide/features/hooks#post_tool_call) | After any tool returns | `tool_name: str, args: dict, result: str, task_id: str, duration_ms: int` | ignored |
-| [`pre_llm_call`](/user-guide/features/hooks#pre_llm_call) | Once per turn, before the tool-calling loop | `session_id: str, user_message: str, conversation_history: list, is_first_turn: bool, model: str, platform: str` | [context injection](#pre_llm_call-context-injection) |
+| [`pre_llm_call`](/user-guide/features/hooks#pre_llm_call) | Once per turn, before the tool-calling loop | `session_id: str, user_message: str, conversation_history: list, is_first_turn: bool, model: str, provider: str, base_url: str, api_mode: str, platform: str` | [context injection](#pre_llm_call-context-injection) |
 | [`post_llm_call`](/user-guide/features/hooks#post_llm_call) | Once per turn, after the tool-calling loop (successful turns only) | `session_id: str, user_message: str, assistant_response: str, conversation_history: list, model: str, platform: str` | ignored |
 | [`on_session_start`](/user-guide/features/hooks#on_session_start) | New session created (first turn only) | `session_id: str, model: str, platform: str` | ignored |
 | [`on_session_end`](/user-guide/features/hooks#on_session_end) | End of every `run_conversation` call + CLI exit | `session_id: str, completed: bool, interrupted: bool, model: str, platform: str` | ignored |
@@ -718,6 +718,35 @@ Injected context is appended to the **user message**, not the system prompt. Thi
 - **Prompt cache preservation** — the system prompt stays identical across turns. Anthropic and OpenRouter cache the system prompt prefix, so keeping it stable saves 75%+ on input tokens in multi-turn conversations. If plugins modified the system prompt, every turn would be a cache miss.
 - **Ephemeral** — the injection happens at API call time only. The original user message in the conversation history is never mutated, and nothing is persisted to the session database.
 - **The system prompt is Hermes's territory** — it contains model-specific guidance, tool enforcement rules, personality instructions, and cached skill content. Plugins contribute context alongside the user's input, not by altering the agent's core instructions.
+
+#### Reading client turn metadata
+
+Gateway clients can attach bounded, namespaced JSON metadata to one new turn.
+For example, a Desktop composer middleware can set
+`draft.turnMetadata["acme.review"]` before submission. A backend plugin reads
+its namespace while that turn is executing:
+
+```python
+from hermes_cli.turn_context import get_turn_metadata
+
+
+def inject_review_mode(**kwargs):
+    intent = get_turn_metadata("acme.review")
+    if not isinstance(intent, dict) or intent.get("mode") != "strict":
+        return None
+    return {"context": "Apply the strict review policy for this turn."}
+```
+
+Calling `get_turn_metadata()` without an argument returns the complete
+namespace map. Both forms return defensive copies; mutating them cannot change
+the active turn. Outside an active turn the complete map is empty and a missing
+namespace returns `None`.
+
+Turn metadata is ephemeral transport state. Hermes does not add it to the
+visible message, transcript, system prompt, or provider request, and it is
+cleared when the turn finishes. Treat every value as untrusted client intent,
+not as authentication, authorization, or a replacement for server-side policy
+checks.
 
 #### Example: Memory recall plugin
 

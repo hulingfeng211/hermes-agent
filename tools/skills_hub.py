@@ -291,22 +291,68 @@ def _resolve_lock_install_path(install_path: str, skill_name: str) -> Path:
     return target
 
 
-def _ssrf_safe_http_get(url: str, *, timeout: int = 20) -> httpx.Response:
+def _ssrf_safe_http_get(
+    url: str,
+    *,
+    timeout: int = 20,
+    headers: Optional[Dict[str, str]] = None,
+    allow_private_urls: Optional[bool] = None,
+    verify: Union[bool, str] = True,
+    trust_env: bool = True,
+) -> httpx.Response:
     """Fetch one URL with connect-time SSRF validation and no automatic redirects."""
     from tools.url_safety import create_ssrf_safe_client
 
-    with create_ssrf_safe_client(timeout=timeout, follow_redirects=False) as client:
-        return client.get(url)
+    with create_ssrf_safe_client(
+        timeout=timeout,
+        follow_redirects=False,
+        allow_private_urls=allow_private_urls,
+        verify=verify,
+        trust_env=trust_env,
+    ) as client:
+        return client.get(url, headers=headers)
 
 
-def _guarded_http_get(url: str, *, timeout: int = 20) -> Optional[httpx.Response]:
+def _url_origin(url: str) -> Optional[Tuple[str, str, int]]:
+    """Return a normalized HTTP origin, or ``None`` for malformed URLs."""
+    try:
+        parsed = urlparse(url)
+        scheme = parsed.scheme.lower()
+        host = (parsed.hostname or "").lower().rstrip(".")
+        if scheme not in {"http", "https"} or not host:
+            return None
+        port = parsed.port or (443 if scheme == "https" else 80)
+        return scheme, host, port
+    except ValueError:
+        return None
+
+
+def _guarded_http_get(
+    url: str,
+    *,
+    timeout: int = 20,
+    headers: Optional[Dict[str, str]] = None,
+    allow_private_urls: Optional[bool] = None,
+    allowed_origin: Optional[Tuple[str, str, int]] = None,
+    verify: Union[bool, str] = True,
+    trust_env: bool = True,
+) -> Optional[httpx.Response]:
     """Fetch a URL with SSRF and redirect-target validation."""
     from tools.url_safety import SSRFConnectionBlocked
 
     current_url = url
 
     for _ in range(_MAX_SKILL_FETCH_REDIRECTS + 1):
-        if not is_safe_url(current_url):
+        if allowed_origin is not None and _url_origin(current_url) != allowed_origin:
+            logger.warning("Blocked cross-origin Skills Hub redirect: %s", current_url)
+            return None
+
+        safe_url = (
+            is_safe_url(current_url)
+            if allow_private_urls is None
+            else is_safe_url(current_url, allow_private_urls=allow_private_urls)
+        )
+        if not safe_url:
             logger.warning("Blocked unsafe Skills Hub URL: %s", current_url)
             return None
 
@@ -320,7 +366,16 @@ def _guarded_http_get(url: str, *, timeout: int = 20) -> Optional[httpx.Response
             return None
 
         try:
-            resp = _ssrf_safe_http_get(current_url, timeout=timeout)
+            fetch_kwargs: Dict[str, Any] = {"timeout": timeout}
+            if headers is not None:
+                fetch_kwargs["headers"] = headers
+            if allow_private_urls is not None:
+                fetch_kwargs["allow_private_urls"] = allow_private_urls
+            if verify is not True:
+                fetch_kwargs["verify"] = verify
+            if trust_env is not True:
+                fetch_kwargs["trust_env"] = trust_env
+            resp = _ssrf_safe_http_get(current_url, **fetch_kwargs)
         except (SSRFConnectionBlocked, httpx.HTTPError) as exc:
             logger.debug("Skills Hub fetch failed for %s: %s", current_url, exc)
             return None
@@ -1416,6 +1471,404 @@ class WellKnownSkillSource(SkillSource):
     @staticmethod
     def _wrap_identifier(base_url: str, skill_name: str) -> str:
         return f"well-known:{base_url.rstrip('/')}/{skill_name}"
+
+
+# ---------------------------------------------------------------------------
+# Configured enterprise Agent Skills endpoint
+# ---------------------------------------------------------------------------
+
+_ENTERPRISE_SOURCE_ID_RE = re.compile(r"^[a-z][a-z0-9-]{0,47}$")
+_ENTERPRISE_TOKEN_ENV_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def normalize_enterprise_source_config(raw: Any) -> dict:
+    """Validate and normalize one ``skills.hub.sources`` entry.
+
+    Enterprise hubs deliberately reuse the well-known Agent Skills layout, but
+    receive a stable source id so multiple internal registries can coexist and
+    installed-skill updates remain pinned to their original registry.
+    """
+    if not isinstance(raw, dict):
+        raise ValueError("Enterprise Skill Hub source must be an object")
+
+    source_id = str(raw.get("id") or "").strip().lower()
+    if not _ENTERPRISE_SOURCE_ID_RE.fullmatch(source_id):
+        raise ValueError(
+            "Source id must start with a letter and contain only lowercase "
+            "letters, numbers, and hyphens (maximum 48 characters)"
+        )
+
+    label = str(raw.get("label") or raw.get("name") or "").strip()
+    if not label:
+        raise ValueError("Source name is required")
+    if len(label) > 80:
+        raise ValueError("Source name must be 80 characters or fewer")
+
+    raw_url = str(raw.get("index_url") or raw.get("url") or "").strip()
+    try:
+        parsed = urlparse(raw_url)
+        _ = parsed.port
+    except ValueError as exc:
+        raise ValueError("Index URL is invalid") from exc
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
+        raise ValueError("Index URL must use http:// or https://")
+    if parsed.username or parsed.password:
+        raise ValueError("Credentials are not allowed in the index URL")
+    if parsed.query or parsed.fragment:
+        raise ValueError("Index URL cannot contain a query string or fragment")
+
+    path = parsed.path.rstrip("/")
+    if path.endswith("/index.json"):
+        index_path = path
+    elif path.endswith(WellKnownSkillSource.BASE_PATH):
+        index_path = f"{path}/index.json"
+    else:
+        index_path = f"{path}{WellKnownSkillSource.BASE_PATH}/index.json"
+    index_url = urlunparse(parsed._replace(path=index_path, query="", fragment=""))
+
+    token_env = str(raw.get("token_env") or "").strip()
+    if token_env and not _ENTERPRISE_TOKEN_ENV_RE.fullmatch(token_env):
+        raise ValueError("Token environment variable name is invalid")
+
+    ca_bundle = str(raw.get("ca_bundle") or "").strip()
+
+    return {
+        "id": source_id,
+        "label": label,
+        "index_url": index_url,
+        "token_env": token_env,
+        "allow_private_network": bool(raw.get("allow_private_network", True)),
+        "ca_bundle": ca_bundle,
+    }
+
+
+def load_skills_hub_config() -> dict:
+    """Return the validated, profile-scoped Skills Hub source policy."""
+    try:
+        from hermes_cli.config import load_config
+
+        config = load_config()
+    except Exception:
+        config = {}
+
+    skills_cfg = config.get("skills") if isinstance(config, dict) else {}
+    hub_cfg = skills_cfg.get("hub") if isinstance(skills_cfg, dict) else {}
+    if not isinstance(hub_cfg, dict):
+        hub_cfg = {}
+
+    mode = str(hub_cfg.get("mode") or "public").strip().lower()
+    if mode not in {"public", "hybrid", "private"}:
+        mode = "public"
+
+    sources = []
+    seen = set()
+    for raw in hub_cfg.get("sources") or []:
+        try:
+            source = normalize_enterprise_source_config(raw)
+        except ValueError as exc:
+            logger.warning("Ignoring invalid enterprise Skill Hub source: %s", exc)
+            continue
+        if source["id"] in seen:
+            logger.warning(
+                "Ignoring duplicate enterprise Skill Hub source id: %s",
+                source["id"],
+            )
+            continue
+        seen.add(source["id"])
+        sources.append(source)
+
+    return {"mode": mode, "sources": sources}
+
+
+class EnterpriseSkillSource(SkillSource):
+    """A persistent, profile-scoped well-known source for an enterprise hub."""
+
+    def __init__(self, config: dict):
+        self.config = normalize_enterprise_source_config(config)
+        self.display_name = self.config["label"]
+        self.source_kind = "enterprise"
+        self.configured = True
+        self.removable = True
+        self.status = "unknown"
+        self.last_error: Optional[str] = None
+        self.last_synced_at: Optional[str] = None
+        self._index: Optional[dict] = None
+        self._origin = _url_origin(self.config["index_url"])
+        self._base_url = self.config["index_url"][:-len("/index.json")]
+
+    def source_id(self) -> str:
+        return f"enterprise:{self.config['id']}"
+
+    def trust_level_for(self, identifier: str) -> str:
+        # An internal network location is not itself a code-signing boundary.
+        return "community"
+
+    @property
+    def is_available(self) -> bool:
+        return self._load_index() is not None
+
+    @property
+    def index_url(self) -> str:
+        return self.config["index_url"]
+
+    def probe(self) -> dict:
+        index = self._load_index(force_refresh=True)
+        return {
+            "ok": index is not None,
+            "status": self.status,
+            "last_error": self.last_error,
+            "last_synced_at": self.last_synced_at,
+            "skill_count": len(index.get("skills", [])) if index else 0,
+        }
+
+    def search(self, query: str, limit: int = 10) -> List[SkillMeta]:
+        index = self._load_index()
+        if not index:
+            return []
+
+        needle = query.strip().lower()
+        results: List[SkillMeta] = []
+        for entry in index["skills"]:
+            if not isinstance(entry, dict):
+                continue
+            name = entry.get("name")
+            if not isinstance(name, str):
+                continue
+            try:
+                safe_name = _validate_skill_name(name)
+            except ValueError:
+                continue
+            description = str(entry.get("description") or "")
+            tags = [str(tag) for tag in (entry.get("tags") or []) if isinstance(tag, str)]
+            if needle:
+                haystack = " ".join([safe_name, description, *tags]).lower()
+                if needle not in haystack:
+                    continue
+            results.append(self._to_meta(entry, safe_name))
+            if len(results) >= limit:
+                break
+        return results
+
+    def inspect(self, identifier: str) -> Optional[SkillMeta]:
+        skill_name = self._identifier_skill_name(identifier)
+        if not skill_name:
+            return None
+        entry = self._entry(skill_name)
+        if not entry:
+            return None
+        skill_md = self._fetch_text(f"{self._base_url}/{skill_name}/SKILL.md")
+        if skill_md is None:
+            return None
+        fm = GitHubSource._parse_frontmatter_quick(skill_md)
+        meta = self._to_meta(entry, skill_name)
+        meta.name = str(fm.get("name") or meta.name)
+        meta.description = str(fm.get("description") or meta.description)
+        meta.extra["endpoint"] = f"{self._base_url}/{skill_name}"
+        return meta
+
+    def fetch(self, identifier: str) -> Optional[SkillBundle]:
+        skill_name = self._identifier_skill_name(identifier)
+        if not skill_name:
+            return None
+        entry = self._entry(skill_name)
+        if not entry:
+            return None
+
+        files = entry.get("files", ["SKILL.md"])
+        if not isinstance(files, list) or not files:
+            files = ["SKILL.md"]
+
+        downloaded: Dict[str, str] = {}
+        for rel_path in files:
+            if not isinstance(rel_path, str) or not rel_path:
+                continue
+            try:
+                safe_rel_path = _validate_bundle_rel_path(rel_path)
+            except ValueError:
+                logger.warning(
+                    "Enterprise skill %s advertised unsafe file path: %r",
+                    identifier,
+                    rel_path,
+                )
+                return None
+            text = self._fetch_text(
+                f"{self._base_url}/{skill_name}/{safe_rel_path}"
+            )
+            if text is None:
+                return None
+            downloaded[safe_rel_path] = text
+
+        if "SKILL.md" not in downloaded:
+            return None
+
+        return SkillBundle(
+            name=skill_name,
+            files=downloaded,
+            source=self.source_id(),
+            identifier=self._identifier(skill_name),
+            trust_level="community",
+            metadata={
+                "index_url": self.config["index_url"],
+                "endpoint": f"{self._base_url}/{skill_name}",
+                "files": files,
+                "source_label": self.display_name,
+            },
+        )
+
+    def _identifier_skill_name(self, identifier: str) -> Optional[str]:
+        prefix = f"{self.source_id()}/"
+        if not isinstance(identifier, str) or not identifier.startswith(prefix):
+            return None
+        try:
+            return _validate_skill_name(identifier[len(prefix):])
+        except ValueError:
+            return None
+
+    def _identifier(self, skill_name: str) -> str:
+        return f"{self.source_id()}/{skill_name}"
+
+    def _to_meta(self, entry: dict, skill_name: str) -> SkillMeta:
+        return SkillMeta(
+            name=skill_name,
+            description=str(entry.get("description") or ""),
+            source=self.source_id(),
+            identifier=self._identifier(skill_name),
+            trust_level="community",
+            path=skill_name,
+            tags=[
+                str(tag)
+                for tag in (entry.get("tags") or [])
+                if isinstance(tag, str)
+            ],
+            extra={
+                "index_url": self.config["index_url"],
+                "files": entry.get("files", ["SKILL.md"]),
+                "source_label": self.display_name,
+            },
+        )
+
+    def _entry(self, skill_name: str) -> Optional[dict]:
+        index = self._load_index()
+        if not index:
+            return None
+        for entry in index["skills"]:
+            if isinstance(entry, dict) and entry.get("name") == skill_name:
+                return entry
+        return None
+
+    def _headers(self) -> Optional[Dict[str, str]]:
+        token_env = self.config.get("token_env")
+        if not token_env:
+            return None
+        try:
+            from hermes_cli.config import get_env_value
+
+            token = (get_env_value(token_env) or "").strip()
+        except Exception:
+            token = ""
+        return {"Authorization": f"Bearer {token}"} if token else None
+
+    def _fetch_text(self, url: str) -> Optional[str]:
+        response = self._request(url)
+        if response is None or response.status_code != 200:
+            return None
+        return response.text
+
+    def _request(self, url: str) -> Optional[httpx.Response]:
+        verify: Union[bool, str] = self.config.get("ca_bundle") or True
+        return _guarded_http_get(
+            url,
+            timeout=20,
+            headers=self._headers(),
+            allow_private_urls=self.config["allow_private_network"],
+            allowed_origin=self._origin,
+            verify=verify,
+            # Enterprise mode must not accidentally route through a public
+            # proxy inherited from the desktop process.
+            trust_env=False,
+        )
+
+    def _cache_file(self) -> Path:
+        digest = hashlib.sha256(
+            self.config["index_url"].encode("utf-8")
+        ).hexdigest()[:16]
+        return _index_cache_dir() / f"enterprise_{self.config['id']}_{digest}.json"
+
+    def _read_cache(self, *, fresh_only: bool) -> Optional[dict]:
+        cache_file = self._cache_file()
+        try:
+            age = time.time() - cache_file.stat().st_mtime
+            if fresh_only and age > INDEX_CACHE_TTL:
+                return None
+            data = json.loads(cache_file.read_text(encoding="utf-8"))
+            if not isinstance(data, dict) or not isinstance(data.get("skills"), list):
+                return None
+            self.last_synced_at = datetime.fromtimestamp(
+                cache_file.stat().st_mtime,
+                timezone.utc,
+            ).isoformat()
+            return data
+        except (OSError, json.JSONDecodeError):
+            return None
+
+    def _write_cache(self, data: dict) -> None:
+        cache_file = self._cache_file()
+        cache_file.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            cache_file.write_text(
+                json.dumps(data, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            ignore_file = _hub_dir() / ".ignore"
+            if not ignore_file.exists():
+                ignore_file.write_text(
+                    "# Exclude hub internals from search tools\n*\n",
+                    encoding="utf-8",
+                )
+            self.last_synced_at = datetime.now(timezone.utc).isoformat()
+        except OSError as exc:
+            logger.debug("Could not cache enterprise Skill Hub index: %s", exc)
+
+    def _load_index(self, *, force_refresh: bool = False) -> Optional[dict]:
+        if self._index is not None and not force_refresh:
+            return self._index
+
+        if not force_refresh:
+            cached = self._read_cache(fresh_only=True)
+            if cached is not None:
+                self.status = "cached"
+                self.last_error = None
+                self._index = cached
+                return cached
+
+        response = self._request(self.config["index_url"])
+        if response is not None and response.status_code == 200:
+            try:
+                data = response.json()
+            except json.JSONDecodeError:
+                data = None
+            if isinstance(data, dict) and isinstance(data.get("skills"), list):
+                normalized = {"skills": data["skills"]}
+                self._write_cache(normalized)
+                self.status = "online"
+                self.last_error = None
+                self._index = normalized
+                return normalized
+            self.last_error = "invalid_index"
+        else:
+            self.last_error = (
+                f"http_{response.status_code}" if response is not None else "unreachable"
+            )
+
+        stale = self._read_cache(fresh_only=False)
+        if stale is not None:
+            self.status = "cached"
+            self._index = stale
+            return stale
+
+        self.status = "unreachable"
+        self._index = None
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -4268,11 +4721,22 @@ def create_source_router(auth: Optional[GitHubAuth] = None) -> List[SkillSource]
     if auth is None:
         auth = GitHubAuth()
 
+    hub_config = load_skills_hub_config()
+    enterprise_sources: List[SkillSource] = [
+        EnterpriseSkillSource(source)
+        for source in hub_config["sources"]
+    ]
+
+    # Local optional skills remain available in every mode. Private mode then
+    # adds only explicitly configured enterprise origins: public adapters are
+    # not even constructed, so no status probe/search/fallback can leak egress.
+    local_sources: List[SkillSource] = [OptionalSkillSource()]
+    if hub_config["mode"] == "private":
+        return [*local_sources, *enterprise_sources]
+
     taps_mgr = TapsManager()
     extra_taps = taps_mgr.list_taps()
-
-    sources: List[SkillSource] = [
-        OptionalSkillSource(),        # Official optional skills (highest priority)
+    public_sources: List[SkillSource] = [
         HermesIndexSource(auth=auth), # Centralized index (search + resolved install paths)
         SkillsShSource(auth=auth),
         WellKnownSkillSource(),
@@ -4282,8 +4746,9 @@ def create_source_router(auth: Optional[GitHubAuth] = None) -> List[SkillSource]
         LobeHubSource(),
         BrowseShSource(),   # browse.sh: 169+ site-specific browser automation skills
     ]
-
-    return sources
+    if hub_config["mode"] == "hybrid":
+        return [*local_sources, *enterprise_sources, *public_sources]
+    return [*local_sources, *public_sources]
 
 
 def _search_one_source(
@@ -4312,6 +4777,7 @@ def parallel_search_sources(
     *on_source_done* is an optional callback ``(source_id, count) -> None``
     invoked as each source completes — useful for progress indicators.
     """
+    import contextvars
     from concurrent.futures import as_completed
 
     per_source_limits = per_source_limits or {}
@@ -4369,7 +4835,10 @@ def parallel_search_sources(
     futures = {}
     for src in active:
         lim = per_source_limits.get(src.source_id(), 50)
-        fut = pool.submit(_search_one_source, src, query, lim)
+        # Profile home + secret scopes are contextvars. ThreadPoolExecutor does
+        # not propagate them automatically, so give every worker its own copy.
+        ctx = contextvars.copy_context()
+        fut = pool.submit(ctx.run, _search_one_source, src, query, lim)
         futures[fut] = src.source_id()
 
     try:

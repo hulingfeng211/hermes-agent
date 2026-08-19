@@ -947,6 +947,45 @@ export interface Translations {
       previewFailed: string
       scanFailed: string
       searchFailed: string
+      manageSources: string
+      privateMode: string
+      sources: {
+        title: string
+        subtitle: string
+        networkMode: string
+        modePublic: string
+        modeHybrid: string
+        modePrivate: string
+        privateModeActive: string
+        enterpriseSources: string
+        add: string
+        update: string
+        edit: string
+        remove: string
+        none: string
+        name: string
+        namePlaceholder: string
+        indexUrl: string
+        tokenEnv: string
+        caBundle: string
+        allowPrivate: string
+        optional: string
+        test: string
+        online: (count: number) => string
+        cached: (count: number) => string
+        unreachable: string
+        retry: string
+        cancel: string
+        save: string
+        saving: string
+        saved: string
+        loadFailed: string
+        saveFailed: string
+        testFailed: string
+        nameRequired: string
+        urlInvalid: string
+        tokenEnvInvalid: string
+      }
     }
   }
 
