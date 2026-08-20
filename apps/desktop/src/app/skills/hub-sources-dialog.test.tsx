@@ -69,7 +69,9 @@ describe('HubSourcesDialog', () => {
           {
             id: 'skills',
             label: 'Corporate Hub',
+            protocol: 'well-known',
             index_url: 'http://skills.corp',
+            base_url: '',
             token_env: '',
             allow_private_network: true,
             ca_bundle: ''
@@ -77,6 +79,54 @@ describe('HubSourcesDialog', () => {
         ]
       })
     )
+  })
+
+  it('stores a private SkillHub as a ClawHub-compatible registry', async () => {
+    renderDialog()
+
+    await screen.findByText('No enterprise sources configured.')
+    fireEvent.click(screen.getByRole('button', { name: 'Add source' }))
+    fireEvent.click(screen.getByRole('button', { name: 'ClawHub compatible' }))
+    fireEvent.change(screen.getByLabelText('Name'), { target: { value: 'Private SkillHub' } })
+    fireEvent.change(screen.getByLabelText('Registry URL'), { target: { value: 'https://skillhub.corp' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Add source' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+
+    await waitFor(() =>
+      expect(saveSkillHubConfig).toHaveBeenCalledWith({
+        mode: 'hybrid',
+        sources: [
+          {
+            id: 'skillhub',
+            label: 'Private SkillHub',
+            protocol: 'clawhub',
+            index_url: '',
+            base_url: 'https://skillhub.corp',
+            token_env: '',
+            allow_private_network: true,
+            ca_bundle: ''
+          }
+        ]
+      })
+    )
+  })
+
+  it('rejects registry URLs with query strings before saving', async () => {
+    renderDialog()
+
+    await screen.findByText('No enterprise sources configured.')
+    fireEvent.click(screen.getByRole('button', { name: 'Add source' }))
+    fireEvent.click(screen.getByRole('button', { name: 'ClawHub compatible' }))
+    fireEvent.change(screen.getByLabelText('Name'), { target: { value: 'Private SkillHub' } })
+    fireEvent.change(screen.getByLabelText('Registry URL'), {
+      target: { value: 'https://skillhub.corp?token=not-allowed' }
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Add source' }))
+
+    expect(
+      await screen.findByText('Enter a valid HTTP or HTTPS URL without embedded credentials.')
+    ).toBeTruthy()
+    expect(saveSkillHubConfig).not.toHaveBeenCalled()
   })
 
   it('keeps private mode explicit when no enterprise source is configured', async () => {

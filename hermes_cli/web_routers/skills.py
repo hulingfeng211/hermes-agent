@@ -318,11 +318,11 @@ async def test_skills_hub_source(
     body: SkillHubSourceProbeRequest, profile: Optional[str] = None
 ):
     """Probe one draft enterprise source through the same guarded client."""
-    from tools.skills_hub import EnterpriseSkillSource
+    from tools.skills_hub import create_enterprise_source
 
     try:
         with _config_profile_scope(body.profile or profile):
-            source = EnterpriseSkillSource(body.source.model_dump())
+            source = create_enterprise_source(body.source.model_dump())
             result = await asyncio.to_thread(source.probe)
         return result
     except ValueError as exc:

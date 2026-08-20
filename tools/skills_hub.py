@@ -14,6 +14,7 @@ Used by hermes_cli/skills_hub.py for CLI commands and the /skills slash command.
 """
 
 import hashlib
+import ipaddress
 import json
 import logging
 import os
@@ -29,7 +30,7 @@ from hermes_constants import get_hermes_home
 from hermes_cli._subprocess_compat import windows_hide_flags
 from agent.skill_utils import is_excluded_skill_path
 from typing import Any, Dict, List, Optional, Tuple, Union
-from urllib.parse import unquote, urljoin, urlparse, urlsplit, urlunparse
+from urllib.parse import quote, unquote, urlencode, urljoin, urlparse, urlsplit, urlunparse
 
 import httpx
 import yaml
@@ -121,6 +122,16 @@ def __getattr__(name: str):
 
 _REDIRECT_STATUS_CODES = {301, 302, 303, 307, 308}
 _MAX_SKILL_FETCH_REDIRECTS = 5
+_MAX_SKILL_RESPONSE_BYTES = 5 * 1024 * 1024
+_MAX_SKILL_ARCHIVE_BYTES = 50 * 1024 * 1024
+_MAX_SKILL_ARCHIVE_ENTRIES = 5_000
+_MAX_SKILL_ENTRY_BYTES = 20 * 1024 * 1024
+_MAX_SKILL_EXTRACTED_BYTES = 100 * 1024 * 1024
+_REMOTE_SCAN_IGNORE_FILENAMES = frozenset({".skillignore", ".clawhubignore"})
+
+
+class _SkillsHubResponseTooLarge(RuntimeError):
+    """Raised before a Skills Hub response can be buffered beyond its limit."""
 
 
 # ---------------------------------------------------------------------------
@@ -303,6 +314,7 @@ def _ssrf_safe_http_get(
     timeout: int = 20,
     headers: Optional[Dict[str, str]] = None,
     allow_private_urls: Optional[bool] = None,
+    max_response_bytes: Optional[int] = None,
     verify: Union[bool, str] = True,
     trust_env: bool = True,
 ) -> httpx.Response:
@@ -316,7 +328,40 @@ def _ssrf_safe_http_get(
         verify=verify,
         trust_env=trust_env,
     ) as client:
-        return client.get(url, headers=headers)
+        with client.stream("GET", url, headers=headers) as response:
+            if max_response_bytes is not None:
+                raw_length = response.headers.get("content-length")
+                try:
+                    content_length = int(raw_length) if raw_length is not None else None
+                except (TypeError, ValueError):
+                    content_length = None
+                if content_length is not None and content_length > max_response_bytes:
+                    raise _SkillsHubResponseTooLarge(
+                        f"response exceeds {max_response_bytes} bytes"
+                    )
+
+            chunks: List[bytes] = []
+            received = 0
+            for chunk in response.iter_bytes():
+                received += len(chunk)
+                if max_response_bytes is not None and received > max_response_bytes:
+                    raise _SkillsHubResponseTooLarge(
+                        f"response exceeds {max_response_bytes} bytes"
+                    )
+                chunks.append(chunk)
+
+            # iter_bytes() returns decoded content. Rebuild a detached response
+            # without stale encoding/length headers so callers can safely use
+            # .content, .text, and .json() after the streaming context closes.
+            response_headers = httpx.Headers(response.headers)
+            response_headers.pop("content-encoding", None)
+            response_headers.pop("content-length", None)
+            return httpx.Response(
+                status_code=response.status_code,
+                headers=response_headers,
+                content=b"".join(chunks),
+                request=response.request,
+            )
 
 
 def _url_origin(url: str) -> Optional[Tuple[str, str, int]]:
@@ -333,6 +378,40 @@ def _url_origin(url: str) -> Optional[Tuple[str, str, int]]:
         return None
 
 
+def _canonical_origin(url: str) -> Optional[str]:
+    """Return a stable scheme://host:port representation for provenance."""
+    origin = _url_origin(url)
+    if origin is None:
+        return None
+    scheme, host, port = origin
+    display_host = f"[{host}]" if ":" in host else host
+    return f"{scheme}://{display_host}:{port}"
+
+
+def _canonical_endpoint(url: str) -> Optional[str]:
+    """Return canonical origin plus path for registry provenance pinning."""
+    origin = _canonical_origin(url)
+    if origin is None:
+        return None
+    try:
+        path = urlparse(url).path or "/"
+    except ValueError:
+        return None
+    if path != "/":
+        path = path.rstrip("/")
+    return f"{origin}{path}"
+
+
+def _redact_url_for_log(url: str) -> str:
+    """Remove query/fragment values, which may contain signed download tokens."""
+    try:
+        parsed = urlsplit(url)
+        suffix = "?<redacted>" if parsed.query else ""
+        return f"{parsed.scheme}://{parsed.netloc}{parsed.path}{suffix}"
+    except (TypeError, ValueError):
+        return "<invalid-url>"
+
+
 def _guarded_http_get(
     url: str,
     *,
@@ -340,6 +419,8 @@ def _guarded_http_get(
     headers: Optional[Dict[str, str]] = None,
     allow_private_urls: Optional[bool] = None,
     allowed_origin: Optional[Tuple[str, str, int]] = None,
+    allow_cross_origin_redirects: bool = False,
+    max_response_bytes: Optional[int] = None,
     verify: Union[bool, str] = True,
     trust_env: bool = True,
 ) -> Optional[httpx.Response]:
@@ -349,17 +430,30 @@ def _guarded_http_get(
     current_url = url
 
     for _ in range(_MAX_SKILL_FETCH_REDIRECTS + 1):
-        if allowed_origin is not None and _url_origin(current_url) != allowed_origin:
-            logger.warning("Blocked cross-origin Skills Hub redirect: %s", current_url)
+        current_origin = _url_origin(current_url)
+        outside_allowed_origin = (
+            allowed_origin is not None and current_origin != allowed_origin
+        )
+        if outside_allowed_origin and not allow_cross_origin_redirects:
+            logger.warning(
+                "Blocked cross-origin Skills Hub redirect: %s",
+                _redact_url_for_log(current_url),
+            )
             return None
 
+        # A private-network exception belongs only to the explicitly configured
+        # registry origin. It must never be inherited by a redirect target.
+        current_allow_private = False if outside_allowed_origin else allow_private_urls
         safe_url = (
             is_safe_url(current_url)
-            if allow_private_urls is None
-            else is_safe_url(current_url, allow_private_urls=allow_private_urls)
+            if current_allow_private is None
+            else is_safe_url(current_url, allow_private_urls=current_allow_private)
         )
         if not safe_url:
-            logger.warning("Blocked unsafe Skills Hub URL: %s", current_url)
+            logger.warning(
+                "Blocked unsafe Skills Hub URL: %s",
+                _redact_url_for_log(current_url),
+            )
             return None
 
         blocked = check_website_access(current_url)
@@ -373,29 +467,54 @@ def _guarded_http_get(
 
         try:
             fetch_kwargs: Dict[str, Any] = {"timeout": timeout}
-            if headers is not None:
+            # A configured registry may redirect a package download to an
+            # object-store presigned URL. Follow it only after the normal URL
+            # safety checks, and never forward the registry bearer token to a
+            # different origin.
+            if headers is not None and not outside_allowed_origin:
                 fetch_kwargs["headers"] = headers
-            if allow_private_urls is not None:
-                fetch_kwargs["allow_private_urls"] = allow_private_urls
+            if current_allow_private is not None:
+                fetch_kwargs["allow_private_urls"] = current_allow_private
+            if max_response_bytes is not None:
+                fetch_kwargs["max_response_bytes"] = max_response_bytes
             if verify is not True:
                 fetch_kwargs["verify"] = verify
             if trust_env is not True:
                 fetch_kwargs["trust_env"] = trust_env
             resp = _ssrf_safe_http_get(current_url, **fetch_kwargs)
-        except (SSRFConnectionBlocked, httpx.HTTPError) as exc:
-            logger.debug("Skills Hub fetch failed for %s: %s", current_url, exc)
+        except (SSRFConnectionBlocked, httpx.HTTPError, _SkillsHubResponseTooLarge) as exc:
+            logger.debug(
+                "Skills Hub fetch failed for %s: %s",
+                _redact_url_for_log(current_url),
+                exc,
+            )
             return None
 
         if resp.status_code in _REDIRECT_STATUS_CODES:
             location = getattr(resp, "headers", {}).get("location")
             if not location:
                 return None
-            current_url = urljoin(current_url, location)
+            next_url = urljoin(current_url, location)
+            next_origin = _url_origin(next_url)
+            if (
+                current_origin is not None
+                and current_origin[0] == "https"
+                and (next_origin is None or next_origin[0] != "https")
+            ):
+                logger.warning(
+                    "Blocked HTTPS downgrade in Skills Hub redirect: %s",
+                    _redact_url_for_log(next_url),
+                )
+                return None
+            current_url = next_url
             continue
 
         return resp
 
-    logger.warning("Skills Hub fetch exceeded redirect limit for %s", url)
+    logger.warning(
+        "Skills Hub fetch exceeded redirect limit for %s",
+        _redact_url_for_log(url),
+    )
     return None
 
 
@@ -1485,14 +1604,60 @@ class WellKnownSkillSource(SkillSource):
 
 _ENTERPRISE_SOURCE_ID_RE = re.compile(r"^[a-z][a-z0-9-]{0,47}$")
 _ENTERPRISE_TOKEN_ENV_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_ENTERPRISE_SOURCE_PROTOCOLS = frozenset({"well-known", "clawhub"})
+
+
+class _EnterpriseAuthMissing(RuntimeError):
+    """Raised when a configured enterprise credential cannot be resolved."""
+
+
+def _is_explicit_loopback_host(hostname: Optional[str]) -> bool:
+    """Allow insecure HTTP only for explicit local integration-test hosts."""
+    host = (hostname or "").lower().rstrip(".")
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def _enterprise_auth_context(
+    config: dict,
+) -> Tuple[Optional[Dict[str, str]], str]:
+    """Resolve bearer headers plus a non-secret cache partition identity."""
+    token_env = str(config.get("token_env") or "").strip()
+    if not token_env:
+        return None, "anonymous"
+    try:
+        from hermes_cli.config import get_env_value
+
+        token = (get_env_value(token_env) or "").strip()
+    except Exception as exc:
+        raise _EnterpriseAuthMissing("auth_missing") from exc
+    if not token:
+        raise _EnterpriseAuthMissing("auth_missing")
+    partition = hashlib.sha256(
+        f"{token_env}\0{token}".encode("utf-8")
+    ).hexdigest()
+    return {"Authorization": f"Bearer {token}"}, partition
+
+
+def _fail_closed_hub_config(reason: str) -> dict:
+    logger.error("Skills Hub configuration rejected; using private local-only mode: %s", reason)
+    return {
+        "mode": "private",
+        "sources": [],
+        "configuration_error": "invalid_config",
+    }
 
 
 def normalize_enterprise_source_config(raw: Any) -> dict:
     """Validate and normalize one ``skills.hub.sources`` entry.
 
-    Enterprise hubs deliberately reuse the well-known Agent Skills layout, but
-    receive a stable source id so multiple internal registries can coexist and
-    installed-skill updates remain pinned to their original registry.
+    Enterprise hubs receive a stable source id so multiple internal registries
+    can coexist and installed-skill updates remain pinned to their original
+    registry. ``well-known`` remains the backward-compatible default protocol.
     """
     if not isinstance(raw, dict):
         raise ValueError("Enterprise Skill Hub source must be an object")
@@ -1510,38 +1675,75 @@ def normalize_enterprise_source_config(raw: Any) -> dict:
     if len(label) > 80:
         raise ValueError("Source name must be 80 characters or fewer")
 
-    raw_url = str(raw.get("index_url") or raw.get("url") or "").strip()
+    protocol = str(raw.get("protocol") or "well-known").strip().lower()
+    if protocol not in _ENTERPRISE_SOURCE_PROTOCOLS:
+        raise ValueError(
+            "Source protocol must be 'well-known' or 'clawhub'"
+        )
+
+    raw_url = str(
+        (
+            raw.get("base_url")
+            if protocol == "clawhub"
+            else raw.get("index_url")
+        )
+        or raw.get("url")
+        or raw.get("index_url")
+        or raw.get("base_url")
+        or ""
+    ).strip()
     try:
         parsed = urlparse(raw_url)
         _ = parsed.port
     except ValueError as exc:
-        raise ValueError("Index URL is invalid") from exc
+        raise ValueError("Source URL is invalid") from exc
     if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
-        raise ValueError("Index URL must use http:// or https://")
+        raise ValueError("Source URL must use http:// or https://")
     if parsed.username or parsed.password:
-        raise ValueError("Credentials are not allowed in the index URL")
+        raise ValueError("Credentials are not allowed in the source URL")
     if parsed.query or parsed.fragment:
-        raise ValueError("Index URL cannot contain a query string or fragment")
+        raise ValueError("Source URL cannot contain a query string or fragment")
 
     path = parsed.path.rstrip("/")
-    if path.endswith("/index.json"):
-        index_path = path
-    elif path.endswith(WellKnownSkillSource.BASE_PATH):
-        index_path = f"{path}/index.json"
+    if protocol == "clawhub":
+        api_path = path if path.endswith("/api/v1") else f"{path}/api/v1"
+        base_url = urlunparse(
+            parsed._replace(path=api_path, query="", fragment="")
+        )
+        index_url = ""
     else:
-        index_path = f"{path}{WellKnownSkillSource.BASE_PATH}/index.json"
-    index_url = urlunparse(parsed._replace(path=index_path, query="", fragment=""))
+        if path.endswith("/index.json"):
+            index_path = path
+        elif path.endswith(WellKnownSkillSource.BASE_PATH):
+            index_path = f"{path}/index.json"
+        else:
+            index_path = f"{path}{WellKnownSkillSource.BASE_PATH}/index.json"
+        index_url = urlunparse(
+            parsed._replace(path=index_path, query="", fragment="")
+        )
+        base_url = ""
 
     token_env = str(raw.get("token_env") or "").strip()
     if token_env and not _ENTERPRISE_TOKEN_ENV_RE.fullmatch(token_env):
         raise ValueError("Token environment variable name is invalid")
+    if (
+        token_env
+        and parsed.scheme.lower() != "https"
+        and not _is_explicit_loopback_host(parsed.hostname)
+    ):
+        raise ValueError(
+            "Enterprise sources with a bearer token must use HTTPS "
+            "(HTTP is allowed only for explicit loopback test hosts)"
+        )
 
     ca_bundle = str(raw.get("ca_bundle") or "").strip()
 
     return {
         "id": source_id,
         "label": label,
+        "protocol": protocol,
         "index_url": index_url,
+        "base_url": base_url,
         "token_env": token_env,
         "allow_private_network": bool(raw.get("allow_private_network", True)),
         "ca_bundle": ca_bundle,
@@ -1551,35 +1753,57 @@ def normalize_enterprise_source_config(raw: Any) -> dict:
 def load_skills_hub_config() -> dict:
     """Return the validated, profile-scoped Skills Hub source policy."""
     try:
-        from hermes_cli.config import load_config
+        from hermes_cli import managed_scope
+        from hermes_cli.config import fast_safe_load, get_config_path, load_config
 
+        # load_config() intentionally falls back to defaults/last-known-good on
+        # parse errors. That is unsafe for a network-egress policy: a broken
+        # private-mode file must never silently become the public default.
+        config_paths = [get_config_path()]
+        managed_dir = managed_scope.get_managed_dir()
+        if managed_dir is not None:
+            config_paths.append(managed_dir / "config.yaml")
+        for config_path in config_paths:
+            try:
+                with open(config_path, encoding="utf-8") as config_file:
+                    raw_config = fast_safe_load(config_file)
+            except FileNotFoundError:
+                continue
+            if raw_config is not None and not isinstance(raw_config, dict):
+                return _fail_closed_hub_config(
+                    f"{config_path.name} root is not an object"
+                )
         config = load_config()
-    except Exception:
-        config = {}
+    except Exception as exc:
+        return _fail_closed_hub_config(type(exc).__name__)
 
-    skills_cfg = config.get("skills") if isinstance(config, dict) else {}
-    hub_cfg = skills_cfg.get("hub") if isinstance(skills_cfg, dict) else {}
+    if not isinstance(config, dict):
+        return _fail_closed_hub_config("loaded config is not an object")
+    skills_cfg = config.get("skills", {})
+    if not isinstance(skills_cfg, dict):
+        return _fail_closed_hub_config("skills config is not an object")
+    hub_cfg = skills_cfg.get("hub", {})
     if not isinstance(hub_cfg, dict):
-        hub_cfg = {}
+        return _fail_closed_hub_config("skills.hub is not an object")
 
-    mode = str(hub_cfg.get("mode") or "public").strip().lower()
+    mode = str(hub_cfg.get("mode", "public")).strip().lower()
     if mode not in {"public", "hybrid", "private"}:
-        mode = "public"
+        return _fail_closed_hub_config("skills.hub.mode is invalid")
 
+    raw_sources = hub_cfg.get("sources", [])
+    if not isinstance(raw_sources, list):
+        return _fail_closed_hub_config("skills.hub.sources is not a list")
     sources = []
     seen = set()
-    for raw in hub_cfg.get("sources") or []:
+    for raw in raw_sources:
         try:
             source = normalize_enterprise_source_config(raw)
         except ValueError as exc:
-            logger.warning("Ignoring invalid enterprise Skill Hub source: %s", exc)
-            continue
+            return _fail_closed_hub_config(str(exc))
         if source["id"] in seen:
-            logger.warning(
-                "Ignoring duplicate enterprise Skill Hub source id: %s",
-                source["id"],
+            return _fail_closed_hub_config(
+                f"duplicate enterprise Skill Hub source id: {source['id']}"
             )
-            continue
         seen.add(source["id"])
         sources.append(source)
 
@@ -1591,6 +1815,8 @@ class EnterpriseSkillSource(SkillSource):
 
     def __init__(self, config: dict):
         self.config = normalize_enterprise_source_config(config)
+        if self.config["protocol"] != "well-known":
+            raise ValueError("EnterpriseSkillSource requires the well-known protocol")
         self.display_name = self.config["label"]
         self.source_kind = "enterprise"
         self.configured = True
@@ -1599,6 +1825,7 @@ class EnterpriseSkillSource(SkillSource):
         self.last_error: Optional[str] = None
         self.last_synced_at: Optional[str] = None
         self._index: Optional[dict] = None
+        self._index_partition: Optional[str] = None
         self._origin = _url_origin(self.config["index_url"])
         self._base_url = self.config["index_url"][:-len("/index.json")]
 
@@ -1718,6 +1945,9 @@ class EnterpriseSkillSource(SkillSource):
                 "endpoint": f"{self._base_url}/{skill_name}",
                 "files": files,
                 "source_label": self.display_name,
+                "source_protocol": "well-known",
+                "source_origin": _canonical_origin(self.config["index_url"]),
+                "source_endpoint": _canonical_endpoint(self.config["index_url"]),
             },
         )
 
@@ -1763,16 +1993,12 @@ class EnterpriseSkillSource(SkillSource):
         return None
 
     def _headers(self) -> Optional[Dict[str, str]]:
-        token_env = self.config.get("token_env")
-        if not token_env:
-            return None
-        try:
-            from hermes_cli.config import get_env_value
+        headers, _partition = _enterprise_auth_context(self.config)
+        return headers
 
-            token = (get_env_value(token_env) or "").strip()
-        except Exception:
-            token = ""
-        return {"Authorization": f"Bearer {token}"} if token else None
+    def _credential_partition(self) -> str:
+        _headers, partition = _enterprise_auth_context(self.config)
+        return partition
 
     def _fetch_text(self, url: str) -> Optional[str]:
         response = self._request(url)
@@ -1781,27 +2007,44 @@ class EnterpriseSkillSource(SkillSource):
         return response.text
 
     def _request(self, url: str) -> Optional[httpx.Response]:
+        try:
+            headers = self._headers()
+        except _EnterpriseAuthMissing:
+            self.status = "unreachable"
+            self.last_error = "auth_missing"
+            return None
         verify: Union[bool, str] = self.config.get("ca_bundle") or True
-        return _guarded_http_get(
+        response = _guarded_http_get(
             url,
             timeout=20,
-            headers=self._headers(),
+            headers=headers,
             allow_private_urls=self.config["allow_private_network"],
             allowed_origin=self._origin,
+            max_response_bytes=_MAX_SKILL_RESPONSE_BYTES,
             verify=verify,
             # Enterprise mode must not accidentally route through a public
             # proxy inherited from the desktop process.
             trust_env=False,
         )
+        if response is not None and response.status_code in {401, 403}:
+            self.status = "unreachable"
+            self.last_error = f"http_{response.status_code}"
+        return response
 
-    def _cache_file(self) -> Path:
+    def _cache_file(self, credential_partition: Optional[str] = None) -> Path:
+        partition = credential_partition or self._credential_partition()
         digest = hashlib.sha256(
-            self.config["index_url"].encode("utf-8")
-        ).hexdigest()[:16]
+            f"{self.config['index_url']}\0{partition}".encode("utf-8")
+        ).hexdigest()
         return _index_cache_dir() / f"enterprise_{self.config['id']}_{digest}.json"
 
-    def _read_cache(self, *, fresh_only: bool) -> Optional[dict]:
-        cache_file = self._cache_file()
+    def _read_cache(
+        self,
+        *,
+        fresh_only: bool,
+        credential_partition: Optional[str] = None,
+    ) -> Optional[dict]:
+        cache_file = self._cache_file(credential_partition)
         try:
             age = time.time() - cache_file.stat().st_mtime
             if fresh_only and age > INDEX_CACHE_TTL:
@@ -1817,8 +2060,12 @@ class EnterpriseSkillSource(SkillSource):
         except (OSError, json.JSONDecodeError):
             return None
 
-    def _write_cache(self, data: dict) -> None:
-        cache_file = self._cache_file()
+    def _write_cache(
+        self,
+        data: dict,
+        credential_partition: Optional[str] = None,
+    ) -> None:
+        cache_file = self._cache_file(credential_partition)
         cache_file.parent.mkdir(parents=True, exist_ok=True)
         try:
             cache_file.write_text(
@@ -1836,15 +2083,32 @@ class EnterpriseSkillSource(SkillSource):
             logger.debug("Could not cache enterprise Skill Hub index: %s", exc)
 
     def _load_index(self, *, force_refresh: bool = False) -> Optional[dict]:
-        if self._index is not None and not force_refresh:
+        try:
+            credential_partition = self._credential_partition()
+        except _EnterpriseAuthMissing:
+            self.status = "unreachable"
+            self.last_error = "auth_missing"
+            self._index = None
+            self._index_partition = None
+            return None
+
+        if (
+            self._index is not None
+            and self._index_partition == credential_partition
+            and not force_refresh
+        ):
             return self._index
 
         if not force_refresh:
-            cached = self._read_cache(fresh_only=True)
+            cached = self._read_cache(
+                fresh_only=True,
+                credential_partition=credential_partition,
+            )
             if cached is not None:
                 self.status = "cached"
                 self.last_error = None
                 self._index = cached
+                self._index_partition = credential_partition
                 return cached
 
         response = self._request(self.config["index_url"])
@@ -1855,26 +2119,497 @@ class EnterpriseSkillSource(SkillSource):
                 data = None
             if isinstance(data, dict) and isinstance(data.get("skills"), list):
                 normalized = {"skills": data["skills"]}
-                self._write_cache(normalized)
+                self._write_cache(normalized, credential_partition)
                 self.status = "online"
                 self.last_error = None
                 self._index = normalized
+                self._index_partition = credential_partition
                 return normalized
             self.last_error = "invalid_index"
         else:
-            self.last_error = (
-                f"http_{response.status_code}" if response is not None else "unreachable"
-            )
+            if response is not None:
+                self.last_error = f"http_{response.status_code}"
+            elif self.last_error != "auth_missing":
+                self.last_error = "unreachable"
 
-        stale = self._read_cache(fresh_only=False)
+        if self.last_error == "auth_missing" or (
+            response is not None and response.status_code in {401, 403}
+        ):
+            self.status = "unreachable"
+            self._index = None
+            self._index_partition = None
+            return None
+
+        stale = self._read_cache(
+            fresh_only=False,
+            credential_partition=credential_partition,
+        )
         if stale is not None:
             self.status = "cached"
             self._index = stale
+            self._index_partition = credential_partition
             return stale
 
         self.status = "unreachable"
         self._index = None
+        self._index_partition = None
         return None
+
+
+# ---------------------------------------------------------------------------
+# Configured ClawHub-compatible enterprise source
+# ---------------------------------------------------------------------------
+
+class EnterpriseClawHubSource(SkillSource):
+    """A profile-scoped ClawHub-compatible registry.
+
+    Unlike the public ``ClawHubSource``, this adapter carries a configured
+    origin and optional bearer token, and uses the compatibility contract's
+    ``/search`` and ``/download`` routes. The stable ``enterprise:<id>`` source
+    identity keeps update provenance pinned to the configured registry.
+    """
+
+    _SLUG_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+    def __init__(self, config: dict):
+        self.config = normalize_enterprise_source_config(config)
+        if self.config["protocol"] != "clawhub":
+            raise ValueError(
+                "EnterpriseClawHubSource requires the clawhub protocol"
+            )
+        self.display_name = self.config["label"]
+        self.source_kind = "enterprise"
+        self.configured = True
+        self.removable = True
+        self.status = "unknown"
+        self.last_error: Optional[str] = None
+        self.last_synced_at: Optional[str] = None
+        self._base_url = self.config["base_url"]
+        self._origin = _url_origin(self._base_url)
+
+    def source_id(self) -> str:
+        return f"enterprise:{self.config['id']}"
+
+    def trust_level_for(self, identifier: str) -> str:
+        return "community"
+
+    @property
+    def is_available(self) -> bool:
+        return bool(self.probe()["ok"])
+
+    @property
+    def base_url(self) -> str:
+        return self._base_url
+
+    def probe(self) -> dict:
+        results = self._search("", limit=100, force_refresh=True)
+        return {
+            "ok": self.status in {"online", "cached"},
+            "status": self.status,
+            "last_error": self.last_error,
+            "last_synced_at": self.last_synced_at,
+            # The compatibility API does not guarantee a total count. This is
+            # the visible result count returned by the bounded probe.
+            "skill_count": len(results),
+        }
+
+    def search(self, query: str, limit: int = 10) -> List[SkillMeta]:
+        return self._search(query.strip(), limit=max(1, limit))
+
+    def inspect(self, identifier: str) -> Optional[SkillMeta]:
+        slug = self._identifier_slug(identifier)
+        if not slug:
+            return None
+        data = self._skill_detail(slug)
+        if not data:
+            return None
+        return self._detail_to_meta(data, slug)
+
+    def fetch(self, identifier: str) -> Optional[SkillBundle]:
+        slug = self._identifier_slug(identifier)
+        if not slug:
+            return None
+
+        detail = self._skill_detail(slug)
+        if detail is None:
+            return None
+        version = self._latest_version(slug, detail)
+        if not version:
+            logger.warning(
+                "Enterprise SkillHub fetch failed for %s: no published version",
+                slug,
+            )
+            return None
+
+        files = self._download_zip(slug, version)
+        if "SKILL.md" not in files:
+            logger.warning(
+                "Enterprise SkillHub fetch failed for %s@%s: bundle missing SKILL.md",
+                slug,
+                version,
+            )
+            return None
+
+        return SkillBundle(
+            name=slug,
+            files=files,
+            source=self.source_id(),
+            identifier=self._identifier(slug),
+            trust_level="community",
+            metadata={
+                "base_url": self._base_url,
+                "version": version,
+                "source_label": self.display_name,
+                "source_url": f"{self._base_url}/skills/{quote(slug, safe='')}",
+                "source_protocol": "clawhub",
+                "source_origin": _canonical_origin(self._base_url),
+                "source_endpoint": _canonical_endpoint(self._base_url),
+            },
+        )
+
+    def _search(
+        self,
+        query: str,
+        *,
+        limit: int,
+        force_refresh: bool = False,
+    ) -> List[SkillMeta]:
+        try:
+            credential_partition = self._credential_partition()
+        except _EnterpriseAuthMissing:
+            self.status = "unreachable"
+            self.last_error = "auth_missing"
+            return []
+
+        if not force_refresh:
+            cached = self._read_search_cache(
+                query,
+                limit,
+                credential_partition=credential_partition,
+                fresh_only=True,
+            )
+            if cached is not None:
+                self.status = "cached"
+                self.last_error = None
+                return cached
+
+        url = f"{self._base_url}/search?{urlencode({'q': query, 'page': 0, 'limit': limit})}"
+        response = self._request(url)
+        if response is not None and response.status_code == 200:
+            try:
+                payload = response.json()
+            except json.JSONDecodeError:
+                payload = None
+            raw_results = payload.get("results") if isinstance(payload, dict) else None
+            if isinstance(raw_results, list):
+                results = [
+                    meta
+                    for item in raw_results[:limit]
+                    if isinstance(item, dict)
+                    for meta in [self._search_item_to_meta(item)]
+                    if meta is not None
+                ]
+                self._write_search_cache(
+                    query,
+                    limit,
+                    results,
+                    credential_partition=credential_partition,
+                )
+                self.status = "online"
+                self.last_error = None
+                return results
+            self.last_error = "invalid_search_response"
+        else:
+            if response is not None:
+                self.last_error = f"http_{response.status_code}"
+            elif self.last_error != "auth_missing":
+                self.last_error = "unreachable"
+
+        if self.last_error == "auth_missing" or (
+            response is not None and response.status_code in {401, 403}
+        ):
+            self.status = "unreachable"
+            return []
+
+        stale = self._read_search_cache(
+            query,
+            limit,
+            credential_partition=credential_partition,
+            fresh_only=False,
+        )
+        if stale is not None:
+            self.status = "cached"
+            return stale
+        self.status = "unreachable"
+        return []
+
+    def _search_item_to_meta(self, item: dict) -> Optional[SkillMeta]:
+        slug = str(item.get("slug") or "").strip()
+        if not self._SLUG_RE.fullmatch(slug):
+            return None
+        extra: Dict[str, Any] = {}
+        version = item.get("version")
+        if isinstance(version, str) and version:
+            extra["version"] = version
+        author = item.get("author")
+        if isinstance(author, dict) and author.get("handle"):
+            extra["owner"] = str(author["handle"])
+        return SkillMeta(
+            name=str(item.get("displayName") or item.get("name") or slug),
+            description=str(item.get("summary") or item.get("description") or ""),
+            source=self.source_id(),
+            identifier=self._identifier(slug),
+            trust_level="community",
+            tags=[str(tag) for tag in (item.get("tags") or []) if isinstance(tag, str)],
+            extra=extra,
+        )
+
+    def _detail_to_meta(self, data: dict, slug: str) -> SkillMeta:
+        tags = data.get("tags")
+        normalized_tags = (
+            [str(tag) for tag in tags if isinstance(tag, str)]
+            if isinstance(tags, list)
+            else [str(tag) for tag in tags if str(tag) != "latest"]
+            if isinstance(tags, dict)
+            else []
+        )
+        extra: Dict[str, Any] = {"base_url": self._base_url}
+        latest = data.get("latestVersion")
+        if isinstance(latest, dict) and latest.get("version"):
+            extra["version"] = str(latest["version"])
+        return SkillMeta(
+            name=str(data.get("displayName") or data.get("name") or slug),
+            description=str(data.get("summary") or data.get("description") or ""),
+            source=self.source_id(),
+            identifier=self._identifier(slug),
+            trust_level="community",
+            tags=normalized_tags,
+            extra=extra,
+        )
+
+    def _skill_detail(self, slug: str) -> Optional[dict]:
+        payload = self._request_json(
+            f"{self._base_url}/skills/{quote(slug, safe='')}"
+        )
+        if not isinstance(payload, dict):
+            return None
+        nested = payload.get("skill")
+        if not isinstance(nested, dict):
+            return payload
+        merged = dict(nested)
+        for field_name in ("latestVersion", "owner", "moderation"):
+            if field_name in payload and field_name not in merged:
+                merged[field_name] = payload[field_name]
+        return merged
+
+    def _latest_version(self, slug: str, detail: dict) -> Optional[str]:
+        latest = detail.get("latestVersion")
+        if isinstance(latest, dict):
+            version = latest.get("version")
+            if isinstance(version, str) and version:
+                return version
+
+        payload = self._request_json(
+            f"{self._base_url}/resolve?{urlencode({'slug': slug})}"
+        )
+        if not isinstance(payload, dict):
+            return None
+        for key in ("match", "latestVersion"):
+            candidate = payload.get(key)
+            if isinstance(candidate, dict):
+                version = candidate.get("version")
+                if isinstance(version, str) and version:
+                    return version
+        return None
+
+    def _download_zip(self, slug: str, version: str) -> Dict[str, Union[str, bytes]]:
+        import io
+        import stat
+        import zipfile
+
+        response = self._request(
+            f"{self._base_url}/download?{urlencode({'slug': slug, 'version': version})}",
+            allow_cross_origin_redirects=True,
+            max_response_bytes=_MAX_SKILL_ARCHIVE_BYTES,
+        )
+        if response is None or response.status_code != 200:
+            return {}
+        content = response.content
+        if len(content) > _MAX_SKILL_ARCHIVE_BYTES:
+            logger.warning("Enterprise SkillHub archive exceeds compressed size limit")
+            return {}
+
+        files: Dict[str, Union[str, bytes]] = {}
+        try:
+            with zipfile.ZipFile(io.BytesIO(content)) as archive:
+                entries = [entry for entry in archive.infolist() if not entry.is_dir()]
+                if len(entries) > _MAX_SKILL_ARCHIVE_ENTRIES:
+                    return {}
+                total_size = 0
+                seen_paths: set[str] = set()
+                for entry in entries:
+                    total_size += entry.file_size
+                    if (
+                        entry.file_size > _MAX_SKILL_ENTRY_BYTES
+                        or total_size > _MAX_SKILL_EXTRACTED_BYTES
+                    ):
+                        return {}
+                    if stat.S_IFMT(entry.external_attr >> 16) == stat.S_IFLNK:
+                        return {}
+                    try:
+                        path = _validate_bundle_rel_path(entry.filename)
+                    except ValueError:
+                        return {}
+                    path_key = path.casefold()
+                    if path_key in seen_paths:
+                        return {}
+                    seen_paths.add(path_key)
+                    raw = archive.read(entry)
+                    try:
+                        files[path] = raw.decode("utf-8")
+                    except UnicodeDecodeError:
+                        files[path] = raw
+        except (OSError, zipfile.BadZipFile, RuntimeError):
+            return {}
+        return files
+
+    def _identifier_slug(self, identifier: str) -> Optional[str]:
+        prefix = f"{self.source_id()}/"
+        if not isinstance(identifier, str) or not identifier.startswith(prefix):
+            return None
+        slug = identifier[len(prefix):]
+        return slug if self._SLUG_RE.fullmatch(slug) else None
+
+    def _identifier(self, slug: str) -> str:
+        return f"{self.source_id()}/{slug}"
+
+    def _headers(self) -> Optional[Dict[str, str]]:
+        headers, _partition = _enterprise_auth_context(self.config)
+        return headers
+
+    def _credential_partition(self) -> str:
+        _headers, partition = _enterprise_auth_context(self.config)
+        return partition
+
+    def _request(
+        self,
+        url: str,
+        *,
+        allow_cross_origin_redirects: bool = False,
+        max_response_bytes: int = _MAX_SKILL_RESPONSE_BYTES,
+    ) -> Optional[httpx.Response]:
+        try:
+            headers = self._headers()
+        except _EnterpriseAuthMissing:
+            self.status = "unreachable"
+            self.last_error = "auth_missing"
+            return None
+        verify: Union[bool, str] = self.config.get("ca_bundle") or True
+        response = _guarded_http_get(
+            url,
+            timeout=30,
+            headers=headers,
+            allow_private_urls=self.config["allow_private_network"],
+            allowed_origin=self._origin,
+            allow_cross_origin_redirects=allow_cross_origin_redirects,
+            max_response_bytes=max_response_bytes,
+            verify=verify,
+            trust_env=False,
+        )
+        if response is not None and response.status_code in {401, 403}:
+            self.status = "unreachable"
+            self.last_error = f"http_{response.status_code}"
+        return response
+
+    def _request_json(self, url: str) -> Optional[Any]:
+        response = self._request(url)
+        if response is None or response.status_code != 200:
+            return None
+        try:
+            return response.json()
+        except json.JSONDecodeError:
+            return None
+
+    def _search_cache_file(
+        self,
+        query: str,
+        limit: int,
+        credential_partition: str,
+    ) -> Path:
+        digest = hashlib.sha256(
+            f"{self._base_url}\0{credential_partition}\0{query}\0{limit}".encode(
+                "utf-8"
+            )
+        ).hexdigest()
+        return _index_cache_dir() / (
+            f"enterprise_clawhub_{self.config['id']}_{digest}.json"
+        )
+
+    def _read_search_cache(
+        self,
+        query: str,
+        limit: int,
+        *,
+        credential_partition: str,
+        fresh_only: bool,
+    ) -> Optional[List[SkillMeta]]:
+        cache_file = self._search_cache_file(query, limit, credential_partition)
+        try:
+            age = time.time() - cache_file.stat().st_mtime
+            if fresh_only and age > INDEX_CACHE_TTL:
+                return None
+            payload = json.loads(cache_file.read_text(encoding="utf-8"))
+            if not isinstance(payload, list):
+                return None
+            results = [SkillMeta(**item) for item in payload if isinstance(item, dict)]
+            self.last_synced_at = datetime.fromtimestamp(
+                cache_file.stat().st_mtime,
+                timezone.utc,
+            ).isoformat()
+            return results
+        except (OSError, TypeError, json.JSONDecodeError):
+            return None
+
+    def _write_search_cache(
+        self,
+        query: str,
+        limit: int,
+        results: List[SkillMeta],
+        *,
+        credential_partition: str,
+    ) -> None:
+        cache_file = self._search_cache_file(query, limit, credential_partition)
+        cache_file.parent.mkdir(parents=True, exist_ok=True)
+        payload = [
+            {
+                "name": item.name,
+                "description": item.description,
+                "source": item.source,
+                "identifier": item.identifier,
+                "trust_level": item.trust_level,
+                "repo": item.repo,
+                "path": item.path,
+                "tags": item.tags,
+                "extra": item.extra,
+            }
+            for item in results
+        ]
+        try:
+            cache_file.write_text(
+                json.dumps(payload, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            self.last_synced_at = datetime.now(timezone.utc).isoformat()
+        except OSError as exc:
+            logger.debug("Could not cache enterprise ClawHub search: %s", exc)
+
+
+def create_enterprise_source(config: dict) -> SkillSource:
+    """Create the configured enterprise adapter selected by its protocol."""
+    normalized = normalize_enterprise_source_config(config)
+    if normalized["protocol"] == "clawhub":
+        return EnterpriseClawHubSource(normalized)
+    return EnterpriseSkillSource(normalized)
 
 
 # ---------------------------------------------------------------------------
@@ -3789,13 +4524,19 @@ class OptionalSkillSource(SkillSource):
     OFFICIAL_REPO = "NousResearch/hermes-agent"
     OPTIONAL_SKILLS_PREFIX = "optional-skills"
 
-    def __init__(self, auth: Optional[GitHubAuth] = None):
+    def __init__(
+        self,
+        auth: Optional[GitHubAuth] = None,
+        *,
+        allow_remote_fallback: bool = True,
+    ):
         from hermes_constants import get_optional_skills_dir
 
         self._optional_dir = get_optional_skills_dir(
             Path(__file__).parent.parent / "optional-skills"
         )
         self._auth = auth
+        self._allow_remote_fallback = allow_remote_fallback
         # Lazily created GitHubSource for the live-repo fallback — only
         # instantiated when a skill is missing from the local checkout.
         self._github: Optional[GitHubSource] = None
@@ -3827,7 +4568,7 @@ class OptionalSkillSource(SkillSource):
 
         # Also surface skills that landed on live main after this install was
         # cut (missing from the local optional-skills/ checkout).
-        if len(results) < limit:
+        if self._allow_remote_fallback and len(results) < limit:
             for rel_dir in sorted(self._list_remote_skill_dirs()):
                 if rel_dir in local_rels:
                     continue
@@ -3872,6 +4613,8 @@ class OptionalSkillSource(SkillSource):
             if not skill_dir:
                 # Not in the local checkout — the skill may have landed on
                 # main after this install was cut. Fall back to the live repo.
+                if not self._allow_remote_fallback:
+                    return None
                 return self._fetch_from_live_repo(rel)
         else:
             skill_dir = resolved
@@ -3915,6 +4658,8 @@ class OptionalSkillSource(SkillSource):
                 return meta
 
         # Not in the local checkout — check live main.
+        if not self._allow_remote_fallback:
+            return None
         remote_dirs = self._list_remote_skill_dirs()
         matches = [d for d in remote_dirs if d.rsplit("/", 1)[-1] == skill_name]
         if len(matches) == 1:
@@ -3950,6 +4695,8 @@ class OptionalSkillSource(SkillSource):
         ``category/skill`` (used verbatim) or a bare skill name (located via
         the repo tree).
         """
+        if not self._allow_remote_fallback:
+            return None
         rel = rel.strip("/")
         if not rel:
             return None
@@ -4018,6 +4765,8 @@ class OptionalSkillSource(SkillSource):
         GitHubSource, plus the shared on-disk index cache). Returns {} when
         the network/API is unavailable — callers degrade to local-only.
         """
+        if not self._allow_remote_fallback:
+            return {}
         if self._remote_dirs is not None:
             return self._remote_dirs
 
@@ -4346,7 +5095,16 @@ def quarantine_bundle(bundle: SkillBundle) -> Path:
     validated_files: List[Tuple[str, Union[str, bytes]]] = []
     for rel_path, file_content in bundle.files.items():
         safe_rel_path = _validate_bundle_rel_path(rel_path)
+        if safe_rel_path.casefold() in _REMOTE_SCAN_IGNORE_FILENAMES:
+            # Hub content must not control the scanner's visibility. Omitting
+            # the control file means every other bundle file is scanned and
+            # then installed; the upstream ignore pattern never takes effect.
+            continue
         validated_files.append((safe_rel_path, file_content))
+
+    # Keep the bundle manifest/hash symmetric with what is actually quarantined
+    # and later moved into the installed skill directory.
+    bundle.files = dict(validated_files)
 
     dest = _quarantine_dir() / skill_name
     if dest.exists():
@@ -4576,6 +5334,8 @@ def bundle_content_hash(bundle: SkillBundle) -> str:
     normalized = {
         rel_path.replace("\\", "/"): content
         for rel_path, content in bundle.files.items()
+        if rel_path.replace("\\", "/").casefold()
+        not in _REMOTE_SCAN_IGNORE_FILENAMES
     }
     for rel_path in sorted(normalized):
         # Include the path so swapping file contents between two paths
@@ -4590,12 +5350,65 @@ def bundle_content_hash(bundle: SkillBundle) -> str:
     return f"sha256:{h.hexdigest()[:16]}"
 
 
-def _source_matches(source: SkillSource, source_name: str) -> bool:
+def _source_matches(
+    source: SkillSource,
+    source_name: str,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> bool:
+    """Match a lock entry to its adapter without changing enterprise origin."""
     aliases = {
         "skills.sh": "skills-sh",
     }
     normalized = aliases.get(source_name, source_name)
-    return source.source_id() == normalized
+    if source.source_id() != normalized:
+        return False
+    if not normalized.startswith("enterprise:"):
+        return True
+
+    config = getattr(source, "config", None)
+    if not isinstance(config, dict) or not isinstance(metadata, dict):
+        return False
+
+    current_protocol = str(config.get("protocol") or "").strip().lower()
+    current_url = (
+        config.get("base_url")
+        if current_protocol == "clawhub"
+        else config.get("index_url")
+    )
+    current_origin = _canonical_origin(str(current_url or ""))
+    current_endpoint = _canonical_endpoint(str(current_url or ""))
+
+    locked_protocol = str(metadata.get("source_protocol") or "").strip().lower()
+    if not locked_protocol:
+        if metadata.get("base_url"):
+            locked_protocol = "clawhub"
+        elif metadata.get("index_url"):
+            locked_protocol = "well-known"
+    locked_origin = metadata.get("source_origin")
+    if not locked_origin:
+        legacy_url = (
+            metadata.get("base_url")
+            if locked_protocol == "clawhub"
+            else metadata.get("index_url")
+        )
+        locked_origin = _canonical_origin(str(legacy_url or ""))
+    locked_endpoint = metadata.get("source_endpoint")
+    if not locked_endpoint:
+        legacy_url = (
+            metadata.get("base_url")
+            if locked_protocol == "clawhub"
+            else metadata.get("index_url")
+        )
+        locked_endpoint = _canonical_endpoint(str(legacy_url or ""))
+
+    return (
+        locked_protocol in _ENTERPRISE_SOURCE_PROTOCOLS
+        and locked_protocol == current_protocol
+        and isinstance(locked_origin, str)
+        and locked_origin == current_origin
+        and isinstance(locked_endpoint, str)
+        and locked_endpoint == current_endpoint
+    )
 
 
 def check_for_skill_updates(
@@ -4618,7 +5431,11 @@ def check_for_skill_updates(
     for entry in installed:
         identifier = entry.get("identifier", "")
         source_name = entry.get("source", "")
-        candidate_sources = [src for src in sources if _source_matches(src, source_name)]
+        candidate_sources = [
+            src
+            for src in sources
+            if _source_matches(src, source_name, entry.get("metadata"))
+        ]
         if not candidate_sources:
             # No adapter for the recorded source (e.g. a tap was removed, or the
             # source was renamed upstream). Previously this fell back to *all*
@@ -4965,14 +5782,19 @@ def create_source_router(auth: Optional[GitHubAuth] = None) -> List[SkillSource]
 
     hub_config = load_skills_hub_config()
     enterprise_sources: List[SkillSource] = [
-        EnterpriseSkillSource(source)
+        create_enterprise_source(source)
         for source in hub_config["sources"]
     ]
 
     # Local optional skills remain available in every mode. Private mode then
     # adds only explicitly configured enterprise origins: public adapters are
     # not even constructed, so no status probe/search/fallback can leak egress.
-    local_sources: List[SkillSource] = [OptionalSkillSource(auth=auth)]
+    local_sources: List[SkillSource] = [
+        OptionalSkillSource(
+            auth=auth,
+            allow_remote_fallback=hub_config["mode"] != "private",
+        )
+    ]
     if hub_config["mode"] == "private":
         return [*local_sources, *enterprise_sources]
 

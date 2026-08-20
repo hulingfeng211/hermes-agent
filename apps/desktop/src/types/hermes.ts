@@ -1353,11 +1353,14 @@ export interface SkillHubSource {
 }
 
 export type SkillHubMode = 'hybrid' | 'private' | 'public'
+export type EnterpriseSkillHubProtocol = 'clawhub' | 'well-known'
 
 export interface EnterpriseSkillHubSourceConfig {
   id: string
   label: string
+  protocol: EnterpriseSkillHubProtocol
   index_url: string
+  base_url: string
   token_env: string
   allow_private_network: boolean
   ca_bundle: string

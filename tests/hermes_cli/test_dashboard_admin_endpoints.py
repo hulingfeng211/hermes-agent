@@ -667,7 +667,7 @@ class TestSkillsHubSourcesEndpoint:
                 {
                     "id": "corp",
                     "label": "Corporate Hub",
-                    "index_url": "http://skills.corp",
+                    "index_url": "https://skills.corp",
                     "token_env": "CORP_SKILLHUB_TOKEN",
                     "allow_private_network": True,
                     "ca_bundle": "/etc/ssl/corp-ca.pem",
@@ -683,9 +683,42 @@ class TestSkillsHubSourcesEndpoint:
         assert body["sources"] == [
             {
                 **payload["sources"][0],
-                "index_url": "http://skills.corp/.well-known/skills/index.json",
+                "protocol": "well-known",
+                "index_url": "https://skills.corp/.well-known/skills/index.json",
+                "base_url": "",
             }
         ]
+
+    def test_clawhub_source_config_round_trip(self):
+        payload = {
+            "mode": "private",
+            "sources": [
+                {
+                    "id": "corp",
+                    "label": "Corporate SkillHub",
+                    "protocol": "clawhub",
+                    "base_url": "https://skillhub.corp",
+                    "token_env": "CORP_SKILLHUB_TOKEN",
+                    "allow_private_network": True,
+                    "ca_bundle": "",
+                }
+            ],
+        }
+
+        response = self.client.put("/api/skills/hub/config", json=payload)
+        assert response.status_code == 200
+        body = self.client.get("/api/skills/hub/config").json()
+
+        assert body == {
+            "mode": "private",
+            "sources": [
+                {
+                    **payload["sources"][0],
+                    "base_url": "https://skillhub.corp/api/v1",
+                    "index_url": "",
+                }
+            ],
+        }
 
     def test_source_probe_uses_enterprise_adapter(self, monkeypatch):
         monkeypatch.setattr(

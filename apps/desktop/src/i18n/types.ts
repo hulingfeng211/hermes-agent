@@ -1136,7 +1136,11 @@ export interface Translations {
         none: string
         name: string
         namePlaceholder: string
+        protocol: string
+        protocolWellKnown: string
+        protocolClawHub: string
         indexUrl: string
+        registryUrl: string
         tokenEnv: string
         caBundle: string
         allowPrivate: string

@@ -77,6 +77,8 @@ import type {
   WebhooksResponse
 } from '@/types/hermes'
 
+export type { EnterpriseSkillHubProtocol } from '@/types/hermes'
+
 // Desktop startup fires a burst of read-only data calls (config, profiles,
 // model info/options, cron) the moment the backend passes readiness. On a
 // profile-heavy or remote install these can each take tens of seconds — e.g.

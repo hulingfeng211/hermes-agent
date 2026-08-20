@@ -649,7 +649,7 @@ hermes skills tap add myorg/skills-repo           # Add a custom GitHub source
 | `official` | `official/security/1password` | Optional skills shipped with Hermes. |
 | `skills-sh` | `skills-sh/vercel-labs/agent-skills/vercel-react-best-practices` | Searchable via `hermes skills search <query> --source skills-sh`. Hermes resolves alias-style skills when the skills.sh slug differs from the repo folder. |
 | `well-known` | `well-known:https://mintlify.com/docs/.well-known/skills/mintlify` | Skills served directly from `/.well-known/skills/index.json` on a website. Search using the site or docs URL. |
-| `enterprise:<id>` | `enterprise:corp/deploy-helper` | A persistent, profile-scoped well-known endpoint configured for an organization. Supports private network addresses, bearer-token references, custom CA bundles, and private-only mode. |
+| `enterprise:<id>` | `enterprise:corp/deploy-helper` | A persistent, profile-scoped well-known or ClawHub-compatible registry. Supports private network addresses, bearer-token references, custom CA bundles, and private-only mode. |
 | `url` | `https://sharethis.chat/SKILL.md` | Direct HTTP(S) URL to `SKILL.md` plus explicitly referenced support files. Name resolution: frontmatter → URL slug → interactive prompt → `--name` flag. |
 | `github` | `openai/skills/k8s` | Direct GitHub repo/path installs and custom taps. |
 | `clawhub`, `lobehub`, `browse-sh` | Source-specific identifiers | Community or marketplace integrations. |
@@ -709,9 +709,21 @@ test it, and choose the source policy for the current profile:
 - `public` — only the built-in public registries (the backward-compatible default)
 - `hybrid` — public registries plus configured enterprise sources
 - `private` — local optional skills plus configured enterprise sources; public
-  adapters are not constructed or probed
+  adapters are not constructed or probed, and locally bundled optional skills
+  never fall back to GitHub for search, preview, or installation
 
-The same settings can be managed in `config.yaml`:
+If an existing `config.yaml` cannot be read or parsed, or its `skills.hub`
+policy is invalid, Hermes fails closed to private local-only mode. It does not
+silently restore the public default while the policy is broken.
+
+Enterprise sources support two explicit protocols:
+
+- `well-known` — a site that publishes `/.well-known/skills/index.json`
+- `clawhub` — a private ClawHub-compatible registry, including a self-hosted
+  [iflytek/skillhub](https://github.com/iflytek/skillhub) deployment
+
+The same settings can be managed in `config.yaml`. For a private SkillHub,
+configure the registry root; Hermes normalizes it to `/api/v1`:
 
 ```yaml
 skills:
@@ -720,10 +732,27 @@ skills:
     sources:
       - id: corp
         label: Corporate Skill Hub
-        index_url: https://skills.corp/.well-known/skills/index.json
+        protocol: clawhub
+        base_url: https://skills.corp
         token_env: CORP_SKILLHUB_TOKEN
         allow_private_network: true
         ca_bundle: /etc/ssl/corp-ca.pem
+```
+
+For a well-known source, omit `protocol` (it is the backward-compatible
+default) or set it explicitly:
+
+```yaml
+skills:
+  hub:
+    mode: hybrid
+    sources:
+      - id: docs
+        label: Internal Docs Skills
+        protocol: well-known
+        index_url: https://docs.corp/.well-known/skills/index.json
+        token_env: DOCS_SKILLS_TOKEN
+        allow_private_network: true
 ```
 
 Put the token value in the profile's `.env`, never in `config.yaml` or the URL:
@@ -732,12 +761,40 @@ Put the token value in the profile's `.env`, never in `config.yaml` or the URL:
 CORP_SKILLHUB_TOKEN=replace-with-the-real-token
 ```
 
+A source configured with `token_env` must use HTTPS. Plain HTTP is accepted
+only for an explicit loopback host such as `127.0.0.1` during local integration
+testing. If the named token is absent, the source reports `auth_missing` and
+does not consult a previous user's catalog cache.
+
 Private-address access is scoped to the configured source origin. Redirects
-cannot leave that origin, and cloud metadata/link-local targets remain blocked.
+for registry API calls cannot leave that origin. Package downloads may follow
+an HTTPS object-storage redirect after URL safety checks, but the registry
+bearer token is stripped before the cross-origin request. A redirect never
+inherits the registry's private-network exception, and HTTPS-to-HTTP downgrades
+are blocked. Cloud metadata/link-local targets remain blocked.
 Enterprise skills keep `community` trust and run through the normal quarantine,
-security scan, install audit, and update provenance checks. A last-successful
-index remains browsable if the hub is temporarily unavailable; installing a
-skill whose files were not previously fetched still requires the hub.
+security scan, install audit, and update provenance checks. Registry-provided
+`.skillignore` and `.clawhubignore` files cannot hide package content from this
+scan. Updates stay pinned to the installed source's protocol and full normalized
+endpoint, including its path. A last-successful catalog search remains browsable
+if the same credential's hub is temporarily unavailable; caches are partitioned
+by credential identity and are never used after a `401` or `403`. Installing a
+skill still requires the hub or its package store.
+
+SkillHub team coordinates are represented with compatibility slugs so they
+remain safe local directory names: `@platform/deploy-helper` becomes
+`platform--deploy-helper`. Search, inspect, and install use the configured
+source id:
+
+```bash
+hermes skills search deploy --source enterprise:corp
+hermes skills inspect enterprise:corp/platform--deploy-helper
+hermes skills install enterprise:corp/platform--deploy-helper
+```
+
+Create the API token in SkillHub under **Settings → API Tokens**. The token's
+user and namespace memberships determine which skills Hermes can discover and
+download; Hermes does not reuse a browser or SSO session.
 
 #### 4. Direct GitHub skills (`github`)
 

@@ -92,7 +92,12 @@ def _capture_update(monkeypatch, results) -> tuple[str, list[tuple[str, str, boo
     monkeypatch.setattr(hub, "HubLockFile", lambda: type("L", (), {
         "get_installed": lambda self, name: {"install_path": "category/" + name}
     })())
-    monkeypatch.setattr(cli_hub, "do_install", lambda identifier, category="", force=False, console=None, source_id=None: installs.append((identifier, category, force)))
+    monkeypatch.setattr(
+        cli_hub,
+        "do_install",
+        lambda identifier, category="", force=False, console=None, **_kwargs:
+            installs.append((identifier, category, force)),
+    )
 
     do_update(console=console)
     return sink.getvalue(), installs
@@ -184,6 +189,42 @@ def test_check_for_skill_updates_does_not_fall_back_across_registries():
         "reporting update_available here is the cross-registry hijack"
     )
     assert "bundle" not in results[0], "must not carry a foreign registry's bundle"
+
+
+def test_do_update_passes_enterprise_endpoint_provenance(monkeypatch):
+    import hermes_cli.skills_hub as cli_hub
+    import tools.skills_hub as hub
+
+    metadata = {
+        "source_protocol": "clawhub",
+        "source_origin": "https://skillhub.corp:443",
+        "source_endpoint": "https://skillhub.corp:443/tenant-a/api/v1",
+    }
+    monkeypatch.setattr(hub, "check_for_skill_updates", lambda **_kwargs: [{
+        "name": "deploy-helper",
+        "identifier": "enterprise:corp/deploy-helper",
+        "source": "enterprise:corp",
+        "status": "update_available",
+    }])
+    monkeypatch.setattr(hub, "HubLockFile", lambda: type("L", (), {
+        "get_installed": lambda self, _name: {
+            "install_path": "deploy-helper",
+            "metadata": metadata,
+        },
+    })())
+    calls = []
+    monkeypatch.setattr(
+        cli_hub,
+        "do_install",
+        lambda identifier, **kwargs: calls.append((identifier, kwargs)),
+    )
+    console = Console(file=StringIO(), force_terminal=False, color_system=None)
+
+    do_update(console=console)
+
+    assert calls[0][0] == "enterprise:corp/deploy-helper"
+    assert calls[0][1]["source_id"] == "enterprise:corp"
+    assert calls[0][1]["source_metadata"] == metadata
 
 
 def test_resolve_does_not_pair_catalog_meta_with_foreign_same_name_bundle():
@@ -450,7 +491,7 @@ def _update_env(monkeypatch, tmp_path, *, edit_after_install: bool):
     installs = []
     monkeypatch.setattr(
         cli_hub, "do_install",
-        lambda identifier, category="", force=False, console=None, source_id=None:
+        lambda identifier, category="", force=False, console=None, **_kwargs:
             installs.append(identifier),
     )
 

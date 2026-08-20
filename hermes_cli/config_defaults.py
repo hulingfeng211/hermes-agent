@@ -1964,9 +1964,9 @@ DEFAULT_CONFIG = {
     # always goes to ~/.hermes/skills/.
     "skills": {
         "external_dirs": [],   # e.g. ["~/.agents/skills", "/shared/team-skills"]
-        # Skills Hub source policy. Enterprise sources use the existing
-        # /.well-known/skills/index.json protocol. Tokens remain in .env; only
-        # the environment-variable name is stored here.
+        # Skills Hub source policy. Enterprise sources use either the
+        # /.well-known/skills protocol or a ClawHub-compatible registry API.
+        # Tokens remain in .env; only the environment-variable name is stored.
         "hub": {
             "mode": "public",  # public | hybrid | private
             "sources": [],

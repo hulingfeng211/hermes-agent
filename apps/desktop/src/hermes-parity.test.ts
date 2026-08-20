@@ -49,7 +49,9 @@ describe('Hermes REST parity helpers (hub / mcp / maintenance)', () => {
         {
           id: 'corp',
           label: 'Corporate Hub',
+          protocol: 'well-known',
           index_url: 'http://skills.corp',
+          base_url: '',
           token_env: '',
           allow_private_network: true,
           ca_bundle: ''
@@ -72,7 +74,9 @@ describe('Hermes REST parity helpers (hub / mcp / maintenance)', () => {
     const source = {
       id: 'corp',
       label: 'Corporate Hub',
+      protocol: 'well-known' as const,
       index_url: 'http://10.0.0.5',
+      base_url: '',
       token_env: '',
       allow_private_network: true,
       ca_bundle: ''

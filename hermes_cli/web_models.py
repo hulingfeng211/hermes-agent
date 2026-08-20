@@ -563,7 +563,9 @@ class SkillsUpdateRequest(BaseModel):
 class EnterpriseSkillHubSourceConfig(BaseModel):
     id: str
     label: str
-    index_url: str
+    protocol: Literal["well-known", "clawhub"] = "well-known"
+    index_url: str = ""
+    base_url: str = ""
     token_env: str = ""
     allow_private_network: bool = True
     ca_bundle: str = ""

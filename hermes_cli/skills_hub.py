@@ -533,7 +533,8 @@ def do_install(identifier: str, category: str = "", force: bool = False,
                console: Optional[Console] = None, skip_confirm: bool = False,
                invalidate_cache: bool = True,
                name_override: str = "",
-               source_id: Optional[str] = None) -> None:
+               source_id: Optional[str] = None,
+               source_metadata: Optional[dict] = None) -> None:
     """Fetch, quarantine, scan, confirm, and install a skill.
 
     ``name_override`` lets non-interactive callers (slash commands, gateway,
@@ -549,6 +550,8 @@ def do_install(identifier: str, category: str = "", force: bool = False,
     identifier cannot be fuzzy-resolved to a same-named skill in a different
     registry. Skill names are not namespaced across registries, so an
     unconstrained resolve can silently change a skill's provenance.
+    For enterprise sources, ``source_metadata`` additionally pins the protocol
+    and canonical registry origin recorded when the skill was installed.
     """
     from tools.skills_hub import (
         GitHubAuth, create_source_router, ensure_hub_dirs,
@@ -565,7 +568,11 @@ def do_install(identifier: str, category: str = "", force: bool = False,
     sources = create_source_router(auth)
 
     if source_id:
-        pinned = [src for src in sources if _source_matches(src, source_id)]
+        pinned = [
+            src
+            for src in sources
+            if _source_matches(src, source_id, source_metadata)
+        ]
         if pinned:
             sources = pinned
         else:
@@ -1156,6 +1163,7 @@ def do_update(name: Optional[str] = None, console: Optional[Console] = None,
             force=True,
             console=c,
             source_id=entry.get("source", "") or None,
+            source_metadata=(installed or {}).get("metadata") or None,
         )
 
     updated_count = len(updates) - len(skipped_local)

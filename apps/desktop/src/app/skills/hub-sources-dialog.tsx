@@ -15,6 +15,7 @@ import { Input } from '@/components/ui/input'
 import { SegmentedControl } from '@/components/ui/segmented-control'
 import { Switch } from '@/components/ui/switch'
 import {
+  type EnterpriseSkillHubProtocol,
   type EnterpriseSkillHubSourceConfig,
   getSkillHubConfig,
   type ProfileScope,
@@ -22,6 +23,7 @@ import {
   saveSkillHubConfig,
   type SkillHubMode,
   type SkillHubSourceProbeResponse,
+  type SkillHubSourcesResponse,
   testSkillHubSource
 } from '@/hermes'
 import { useI18n } from '@/i18n'
@@ -40,9 +42,10 @@ interface HubSourcesDialogProps {
 interface SourceDraft {
   allowPrivateNetwork: boolean
   caBundle: string
+  endpointUrl: string
   id: string
-  indexUrl: string
   label: string
+  protocol: EnterpriseSkillHubProtocol
   tokenEnv: string
 }
 
@@ -50,9 +53,10 @@ function emptyDraft(): SourceDraft {
   return {
     allowPrivateNetwork: true,
     caBundle: '',
+    endpointUrl: '',
     id: '',
-    indexUrl: '',
     label: '',
+    protocol: 'well-known',
     tokenEnv: ''
   }
 }
@@ -89,9 +93,11 @@ function sourceId(label: string, indexUrl: string, existing: EnterpriseSkillHubS
 
 function toSource(draft: SourceDraft, existing: EnterpriseSkillHubSourceConfig[]): EnterpriseSkillHubSourceConfig {
   return {
-    id: draft.id || sourceId(draft.label, draft.indexUrl, existing),
+    id: draft.id || sourceId(draft.label, draft.endpointUrl, existing),
     label: draft.label.trim(),
-    index_url: draft.indexUrl.trim(),
+    protocol: draft.protocol,
+    index_url: draft.protocol === 'well-known' ? draft.endpointUrl.trim() : '',
+    base_url: draft.protocol === 'clawhub' ? draft.endpointUrl.trim() : '',
     token_env: draft.tokenEnv.trim(),
     allow_private_network: draft.allowPrivateNetwork,
     ca_bundle: draft.caBundle.trim()
@@ -154,13 +160,23 @@ export function HubSourcesDialog({ onOpenChange, open, profile }: HubSourcesDial
     [h]
   )
 
+  const protocolOptions = useMemo(
+    () => [
+      { id: 'well-known' as const, label: h.protocolWellKnown },
+      { id: 'clawhub' as const, label: h.protocolClawHub }
+    ],
+    [h]
+  )
+
   const edit = (source: EnterpriseSkillHubSourceConfig) => {
+    const protocol = source.protocol || 'well-known'
     setDraft({
       allowPrivateNetwork: source.allow_private_network,
       caBundle: source.ca_bundle,
+      endpointUrl: protocol === 'clawhub' ? source.base_url : source.index_url,
       id: source.id,
-      indexUrl: source.index_url,
       label: source.label,
+      protocol,
       tokenEnv: source.token_env
     })
     setFormError('')
@@ -175,9 +191,15 @@ export function HubSourcesDialog({ onOpenChange, open, profile }: HubSourcesDial
     }
 
     try {
-      const parsed = new URL(draft.indexUrl.trim())
+      const parsed = new URL(draft.endpointUrl.trim())
 
-      if (!['http:', 'https:'].includes(parsed.protocol) || parsed.username || parsed.password) {
+      if (
+        !['http:', 'https:'].includes(parsed.protocol) ||
+        parsed.username ||
+        parsed.password ||
+        parsed.search ||
+        parsed.hash
+      ) {
         throw new Error('invalid')
       }
     } catch {
@@ -254,6 +276,9 @@ export function HubSourcesDialog({ onOpenChange, open, profile }: HubSourcesDial
 
     try {
       await saveSkillHubConfig({ mode, sources }, profile)
+      queryClient.setQueryData<SkillHubSourcesResponse>([...HUB_SOURCES_KEY, profile ?? null], current =>
+        current ? { ...current, mode } : current
+      )
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: [...HUB_CONFIG_KEY, scopeKey] }),
         queryClient.invalidateQueries({ queryKey: HUB_SOURCES_KEY })
@@ -325,7 +350,7 @@ export function HubSourcesDialog({ onOpenChange, open, profile }: HubSourcesDial
                         <div className="min-w-0 flex-1">
                           <div className="truncate text-xs font-medium text-foreground">{source.label}</div>
                           <div className="truncate font-mono text-[0.64rem] text-muted-foreground">
-                            {source.index_url}
+                            {source.protocol === 'clawhub' ? source.base_url : source.index_url}
                           </div>
                           {result && (
                             <div className={`mt-0.5 text-[0.64rem] ${probeTone(result.status)}`}>
@@ -369,6 +394,15 @@ export function HubSourcesDialog({ onOpenChange, open, profile }: HubSourcesDial
 
             {showForm && (
               <div className="grid gap-4 border-t border-(--ui-stroke-tertiary) pt-4">
+                <div className="grid gap-2">
+                  <span className="text-xs font-medium text-foreground">{h.protocol}</span>
+                  <SegmentedControl
+                    className="max-w-full"
+                    onChange={protocol => setDraft(current => ({ ...current, protocol }))}
+                    options={protocolOptions}
+                    value={draft.protocol}
+                  />
+                </div>
                 <div className="grid items-start gap-4 sm:grid-cols-2">
                   <Field htmlFor="hub-source-name" label={h.name}>
                     <Input
@@ -378,12 +412,12 @@ export function HubSourcesDialog({ onOpenChange, open, profile }: HubSourcesDial
                       value={draft.label}
                     />
                   </Field>
-                  <Field htmlFor="hub-source-url" label={h.indexUrl}>
+                  <Field htmlFor="hub-source-url" label={draft.protocol === 'clawhub' ? h.registryUrl : h.indexUrl}>
                     <Input
                       id="hub-source-url"
-                      onChange={event => setDraft(current => ({ ...current, indexUrl: event.target.value }))}
+                      onChange={event => setDraft(current => ({ ...current, endpointUrl: event.target.value }))}
                       placeholder="https://skills.corp"
-                      value={draft.indexUrl}
+                      value={draft.endpointUrl}
                     />
                   </Field>
                   <Field htmlFor="hub-source-token" label={h.tokenEnv} optional optionalLabel={h.optional}>

@@ -17,6 +17,7 @@ const selectToolsetProvider = vi.fn()
 const getUsageAnalytics = vi.fn()
 const getProfiles = vi.fn()
 const getSkillContent = vi.fn()
+const getSkillHubSources = vi.fn()
 
 // Partial mock: keep the real module (SkillsView pulls in @/store/profile,
 // whose import-time subscription calls setApiRequestProfile) and stub only the
@@ -33,7 +34,8 @@ vi.mock('@/hermes', async importOriginal => ({
   selectToolsetProvider: (toolset: string, provider: string) => selectToolsetProvider(toolset, provider),
   getUsageAnalytics: (days: number, profile?: null | string) => getUsageAnalytics(days, profile),
   getProfiles: () => getProfiles(),
-  getSkillContent: (name: string, profile?: null | string) => getSkillContent(name, profile)
+  getSkillContent: (name: string, profile?: null | string) => getSkillContent(name, profile),
+  getSkillHubSources: (profile?: HermesApi.ProfileScope) => getSkillHubSources(profile)
 }))
 
 // Notifications hit nanostores/timers we don't care about here.
@@ -91,6 +93,13 @@ beforeEach(() => {
     name: 'web-research',
     path: '/skills/web-research/SKILL.md',
     content: '---\nname: web-research\nversion: 1.2.0\nauthor: Nous\n---\n\n# Web Research\n\nDeep research steps.'
+  })
+  getSkillHubSources.mockResolvedValue({
+    featured: [],
+    index_available: true,
+    installed: {},
+    mode: 'public',
+    sources: []
   })
   // Single profile by default → the scope selector stays hidden (>1 gate),
   // so existing tests see unchanged single-profile behavior.
@@ -277,7 +286,7 @@ describe('SkillsView toolset management', () => {
     )
 
     // The picker is expanded by default — the hub iframe is live on mount.
-    expect(document.querySelector('iframe')).toBeTruthy()
+    expect(await screen.findByTitle('Skills Hub')).toBeTruthy()
 
     await act(async () => {
       window.dispatchEvent(
@@ -317,7 +326,7 @@ describe('SkillsView toolset management', () => {
       )
     })
 
-    const iframe = document.querySelector('iframe')
+    const iframe = await screen.findByTitle('Skills Hub')
     expect(iframe).toBeTruthy()
     expect(iframe!.closest('section')!.classList.contains('hidden')).toBe(false)
 
@@ -330,6 +339,46 @@ describe('SkillsView toolset management', () => {
     const kept = document.querySelector('iframe')
     expect(kept).toBeTruthy()
     expect(kept!.closest('section')!.classList.contains('hidden')).toBe(true)
+  })
+
+  it('never mounts the public hub iframe in private mode', async () => {
+    getSkillHubSources.mockResolvedValue({
+      featured: [
+        {
+          description: 'Internal summarization workflow',
+          identifier: 'enterprise:corp/summarize-text',
+          name: 'summarize-text',
+          repo: null,
+          source: 'enterprise:corp',
+          tags: [],
+          trust_level: 'community'
+        }
+      ],
+      index_available: false,
+      installed: {},
+      mode: 'private',
+      sources: [
+        {
+          configured: true,
+          id: 'enterprise:corp',
+          kind: 'enterprise',
+          label: 'Corporate SkillHub',
+          removable: true,
+          searchable: true,
+          status: 'online'
+        }
+      ]
+    })
+
+    const { EmbeddedHubPicker } = await import('./embedded-hub-picker')
+    render(
+      <QueryClientProvider client={queryClient}>
+        <EmbeddedHubPicker installedNames={new Set()} profile={null} />
+      </QueryClientProvider>
+    )
+
+    expect(await screen.findByText('summarize-text')).toBeTruthy()
+    expect(document.querySelector('iframe')).toBeNull()
   })
 
   it('shows a vision explainer that deep-links to Settings → Models', async () => {

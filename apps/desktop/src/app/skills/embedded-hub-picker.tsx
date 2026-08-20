@@ -1,18 +1,20 @@
 import { useStore } from '@nanostores/react'
+import { useQuery } from '@tanstack/react-query'
 import { memo, type PointerEvent as ReactPointerEvent, useEffect, useRef, useState } from 'react'
 
 import { Button } from '@/components/ui/button'
 import { Tip } from '@/components/ui/tooltip'
-import type { ProfileScope } from '@/hermes'
+import { getSkillHubSources, type ProfileScope } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { Loader2, Settings2 } from '@/lib/icons'
 import { useStoreSelector } from '@/lib/use-session-slice'
 import { cn } from '@/lib/utils'
-import { $hubActions, installHubSkill, UPDATE_ALL_KEY, updateHubSkills } from '@/store/hub-actions'
+import { $hubActions, HUB_SOURCES_KEY, installHubSkill, UPDATE_ALL_KEY, updateHubSkills } from '@/store/hub-actions'
 import { notify, notifyError } from '@/store/notifications'
 import { $paneHeightOverride, setPaneHeightOverride } from '@/store/panes'
 
 import { HubSourcesDialog } from './hub-sources-dialog'
+import { NativeHubPicker } from './native-hub-picker'
 
 // The REAL Skills Hub page (docs site) embedded as a one-click picker — the
 // same trick the Bot Mode agent editor uses. `?embed=picker` hides the docs
@@ -75,6 +77,14 @@ export const EmbeddedHubPicker = memo(function EmbeddedHubPicker({
   // Subscribe to the ONE flag this header renders, not the whole action map —
   // $hubActions churns on every tailed log line during an install.
   const updating = useStoreSelector($hubActions, actions => actions[UPDATE_ALL_KEY]?.running ?? false)
+
+  const sourcesQuery = useQuery({
+    queryKey: [...HUB_SOURCES_KEY, profile ?? null],
+    queryFn: () => getSkillHubSources(profile),
+    staleTime: 5 * 60_000
+  })
+
+  const publicPicker = sourcesQuery.data?.mode === 'public'
   // Collapse state rides the same persisted height override the sash writes
   // (0 = collapsed to the header), so "Hide the hub browser" survives tab
   // switches and restarts instead of re-expanding — and re-loading the docs
@@ -127,7 +137,7 @@ export const EmbeddedHubPicker = memo(function EmbeddedHubPicker({
   // through the same store pipeline the hub rows use, so the action log,
   // optimistic flips, and Skills-list refresh all come for free.
   useEffect(() => {
-    if (!open) {
+    if (!open || !publicPicker) {
       return undefined
     }
 
@@ -159,7 +169,7 @@ export const EmbeddedHubPicker = memo(function EmbeddedHubPicker({
     window.addEventListener('message', onMessage)
 
     return () => window.removeEventListener('message', onMessage)
-  }, [h, installedNames, open, profile])
+  }, [h, installedNames, open, profile, publicPicker])
 
   const updateAll = () => {
     notify({ kind: 'success', title: h.updateStarted, message: h.actionLog })
@@ -233,24 +243,41 @@ export const EmbeddedHubPicker = memo(function EmbeddedHubPicker({
               width: '100%'
             }}
           >
-            <iframe
-              sandbox="allow-scripts allow-same-origin"
-              src={HUB_PICKER_URL}
-              style={{
-                background: 'transparent',
-                border: 'none',
-                height: '133.34%',
-                // While the sash drags, the cross-origin iframe must not eat
-                // the pointermove stream.
-                pointerEvents: dragging ? 'none' : 'auto',
-                transform: 'scale(0.75)',
-                transformOrigin: 'top left',
-                width: '133.34%'
-              }}
-              title={h.pickerTitle}
-            />
+            {sourcesQuery.isLoading ? (
+              <div className="grid h-full min-h-28 place-items-center text-xs text-(--ui-text-tertiary)">
+                <Loader2 className="size-4 animate-spin" />
+              </div>
+            ) : sourcesQuery.isError || !sourcesQuery.data ? (
+              <div className="grid h-full min-h-28 place-items-center gap-2 p-4 text-center text-xs text-destructive">
+                <span>{h.loadFailed}</span>
+                <Button onClick={() => void sourcesQuery.refetch()} size="xs" variant="text">
+                  {h.search}
+                </Button>
+              </div>
+            ) : publicPicker ? (
+              <iframe
+                sandbox="allow-scripts allow-same-origin"
+                src={HUB_PICKER_URL}
+                style={{
+                  background: 'transparent',
+                  border: 'none',
+                  height: '133.34%',
+                  // While the sash drags, the cross-origin iframe must not eat
+                  // the pointermove stream.
+                  pointerEvents: dragging ? 'none' : 'auto',
+                  transform: 'scale(0.75)',
+                  transformOrigin: 'top left',
+                  width: '133.34%'
+                }}
+                title={h.pickerTitle}
+              />
+            ) : (
+              <NativeHubPicker profile={profile} />
+            )}
           </div>
-          <p className="shrink-0 px-1 text-[0.65rem] leading-4 text-(--ui-text-quaternary)">{h.pickerHint}</p>
+          {publicPicker && (
+            <p className="shrink-0 px-1 text-[0.65rem] leading-4 text-(--ui-text-quaternary)">{h.pickerHint}</p>
+          )}
         </div>
       )}
       <HubSourcesDialog onOpenChange={setSourcesOpen} open={sourcesOpen} profile={profile} />
