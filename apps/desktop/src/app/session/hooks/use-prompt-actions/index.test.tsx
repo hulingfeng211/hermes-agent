@@ -1729,6 +1729,42 @@ describe('usePromptActions submit / queue drain semantics', () => {
     )
   })
 
+  it('commits target admission then middleware state exactly once at the prompt.submit boundary', async () => {
+    const order: string[] = []
+    const controller = new AbortController()
+
+    const requestGateway = vi.fn(async (method: string) => {
+      if (method === 'prompt.submit') {
+        order.push('rpc')
+      }
+
+      return {} as never
+    })
+
+    const admission = {
+      signal: controller.signal,
+      beginSubmit: () => true,
+      isValid: () => true,
+      commit: () => {
+        order.push('target')
+
+        return true
+      }
+    }
+
+    const commitComposerAdmission = vi.fn(() => order.push('middleware'))
+
+    let handle: HarnessHandle | null = null
+    await actRender(
+      <Harness onReady={h => (handle = h)} refreshSessions={async () => undefined} requestGateway={requestGateway} />
+    )
+
+    await handle!.submitText('admitted question', { composerAdmission: admission, commitComposerAdmission })
+
+    expect(order).toEqual(['target', 'middleware', 'rpc'])
+    expect(commitComposerAdmission).toHaveBeenCalledTimes(1)
+  })
+
   it('arms turnStartedAt at submit time instead of waiting for message.start', async () => {
     const seeds: Record<string, unknown>[] = []
     const requestGateway = vi.fn(async () => ({}) as never)

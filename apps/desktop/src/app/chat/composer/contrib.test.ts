@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { registry } from '@/contrib/registry'
 
@@ -20,14 +20,14 @@ describe('runComposerMiddleware', () => {
   it('passes the draft through untouched when nothing is registered', async () => {
     const draft = { text: 'hello' }
 
-    expect(await runComposerMiddleware(draft)).toBe(draft)
+    expect((await runComposerMiddleware(draft))?.draft).toBe(draft)
   })
 
   it('chains rewrites in registry order', async () => {
     addMiddleware('b', d => ({ ...d, text: `${d.text}b` }), 20)
     addMiddleware('a', d => ({ ...d, text: `${d.text}a` }), 10)
 
-    expect(await runComposerMiddleware({ text: 'x' })).toEqual({ text: 'xab' })
+    expect((await runComposerMiddleware({ text: 'x' }))?.draft).toEqual({ text: 'xab' })
   })
 
   it('cancels the send when a handler returns null', async () => {
@@ -43,13 +43,42 @@ describe('runComposerMiddleware', () => {
     })
     addMiddleware('after', d => ({ ...d, text: `${d.text}!` }), 99)
 
-    expect(await runComposerMiddleware({ text: 'x' })).toEqual({ text: 'x!' })
+    expect((await runComposerMiddleware({ text: 'x' }))?.draft).toEqual({ text: 'x!' })
   })
 
   it('supports async handlers', async () => {
     addMiddleware('async', async d => ({ ...d, text: d.text.toUpperCase() }))
 
-    expect(await runComposerMiddleware({ text: 'quiet' })).toEqual({ text: 'QUIET' })
+    expect((await runComposerMiddleware({ text: 'quiet' }))?.draft).toEqual({ text: 'QUIET' })
+  })
+
+  it('defers middleware side effects until a one-shot commit', async () => {
+    const calls: string[] = []
+    addMiddleware('first', draft => ({ draft, onCommit: () => calls.push('first') }))
+    addMiddleware('second', draft => ({ draft, onCommit: () => calls.push('second') }))
+
+    const prepared = await runComposerMiddleware({ text: 'send later' })
+
+    expect(calls).toEqual([])
+    prepared?.commit?.()
+    prepared?.commit?.()
+    expect(calls).toEqual(['first', 'second'])
+  })
+
+  it('isolates a throwing commit callback from later middleware callbacks', async () => {
+    const after = vi.fn()
+    addMiddleware('broken-commit', draft => ({
+      draft,
+      onCommit: () => {
+        throw new Error('broken plugin cleanup')
+      }
+    }))
+    addMiddleware('after', draft => ({ draft, onCommit: after }))
+
+    const prepared = await runComposerMiddleware({ text: 'still send' })
+
+    expect(() => prepared?.commit?.()).not.toThrow()
+    expect(after).toHaveBeenCalledTimes(1)
   })
 
   it('passes one immutable target-session snapshot to the middleware chain', async () => {
@@ -65,7 +94,12 @@ describe('runComposerMiddleware', () => {
       return draft
     })
 
-    const context = { runtimeSessionId: 'runtime-tile', storedSessionId: 'stored-tile-root' }
+    const context = {
+      connectionId: 'corp-net',
+      profile: 'research',
+      runtimeSessionId: 'runtime-tile',
+      storedSessionId: 'stored-tile-root'
+    }
 
     await runComposerMiddleware({ text: 'tile turn' }, context)
 

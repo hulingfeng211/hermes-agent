@@ -44,6 +44,7 @@ import {
   isProviderSetupError,
   isSessionBusyError,
   isTargetSessionBusy,
+  oneShotComposerAdmission,
   releaseSubmitInFlight,
   SessionRecoveryAborted,
   type SubmitTextOptions,
@@ -116,7 +117,12 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
 
   return useCallback(
     async (rawText: string, options?: SubmitTextOptions) => {
+      if (options?.composerAdmission && !options.composerAdmission.isValid()) {
+        return false
+      }
+
       const visibleText = sanitizeComposerInput(rawText).trim()
+      const commitComposerAdmission = oneShotComposerAdmission(options?.commitComposerAdmission)
       const usingComposerAttachments = !options?.attachments
 
       // Drop undefined/null holes a session switch or draft restore can leave in
@@ -718,30 +724,45 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
         let submitErr: unknown = null
 
         try {
-          const recoverStoredSessionId = targetStoredSessionId ?? selectedStoredSessionIdRef.current
+          if (options?.composerAdmission) {
+            // Strict external admission: final identity/queue/backend check at
+            // the actual send boundary. Do not busy-retry or stale-session
+            // resume this path — either would retarget an exact plugin intent
+            // after the snapshot it was admitted against had stopped existing.
+            if (!options.composerAdmission.commit()) {
+              return abortForSessionSwitch(liveSessionId)
+            }
 
-          await withSessionNotFoundResume(
-            sessionId,
-            recoverStoredSessionId,
-            liveId =>
-              withSessionBusyRetry(() =>
-                requestGateway('prompt.submit', submitParams(liveId), PROMPT_SUBMIT_REQUEST_TIMEOUT_MS)
-              ),
-            {
-              requestGateway,
-              driftReason: sessionDriftReason,
-              onRecovered: recoveredId => {
-                if (targetIsCurrentView()) {
-                  activeSessionIdRef.current = recoveredId
-                  setActiveSessionId(recoveredId)
+            commitComposerAdmission?.()
+            await requestGateway('prompt.submit', submitParams(liveSessionId), PROMPT_SUBMIT_REQUEST_TIMEOUT_MS)
+          } else {
+            const recoverStoredSessionId = targetStoredSessionId ?? selectedStoredSessionIdRef.current
+
+            await withSessionNotFoundResume(
+              sessionId,
+              recoverStoredSessionId,
+              liveId =>
+                withSessionBusyRetry(() => {
+                  commitComposerAdmission?.()
+
+                  return requestGateway('prompt.submit', submitParams(liveId), PROMPT_SUBMIT_REQUEST_TIMEOUT_MS)
+                }),
+              {
+                requestGateway,
+                driftReason: sessionDriftReason,
+                onRecovered: recoveredId => {
+                  if (targetIsCurrentView()) {
+                    activeSessionIdRef.current = recoveredId
+                    setActiveSessionId(recoveredId)
+                  }
                 }
-              }
-            },
-            // A starved backend loop (#55578 symptom d) rejects the submit even
-            // though the stored session is fine — recover it like a dead id
-            // instead of erroring out and losing the session binding.
-            { alsoTimeout: true }
-          )
+              },
+              // A starved backend loop (#55578 symptom d) rejects the submit even
+              // though the stored session is fine — recover it like a dead id
+              // instead of erroring out and losing the session binding.
+              { alsoTimeout: true }
+            )
+          }
         } catch (firstErr) {
           if (firstErr instanceof SessionRecoveryAborted) {
             console.warn('[submit-drift-abort]', firstErr.reason, { phase: 'post-resume-retry' })

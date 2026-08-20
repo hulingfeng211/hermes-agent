@@ -12,7 +12,9 @@ import {
   setSudoRequest
 } from '@/store/prompts'
 
+import type { QueueEditState } from '../composer-utils'
 import { requestComposerSubmit } from '../focus'
+import type { ChatBarProps } from '../types'
 
 import { useComposerSubmit } from './use-composer-submit'
 
@@ -22,6 +24,7 @@ interface SubmitHarnessOptions {
   compacting?: boolean
   disabled?: boolean
   inputDisabled?: boolean
+  queueEdit?: QueueEditState | null
   queued?: boolean
   text?: string
 }
@@ -32,6 +35,7 @@ function renderSubmitHook({
   compacting = false,
   disabled = false,
   inputDisabled = false,
+  queueEdit = null,
   queued = false,
   text = ''
 }: SubmitHarnessOptions = {}) {
@@ -42,8 +46,9 @@ function renderSubmitHook({
   const editorRef = { current: editor }
   const onCancel = vi.fn()
   const onSteer = vi.fn(async () => true)
-  const onSubmit = vi.fn(async () => true)
+  const onSubmit = vi.fn<ChatBarProps['onSubmit']>(async () => true)
   const queueCurrentDraft = vi.fn(() => true)
+  const queueEditRef = { current: queueEdit }
   const loadIntoComposer = vi.fn()
   const stashAt = vi.fn()
 
@@ -59,6 +64,12 @@ function renderSubmitHook({
       attachments,
       busy,
       compacting,
+      composerContext: {
+        connectionId: null,
+        profile: 'default',
+        runtimeSessionId: 'runtime-session',
+        storedSessionId: 'stored-session'
+      },
       clearDraft,
       disabled,
       draftRef,
@@ -72,7 +83,8 @@ function renderSubmitHook({
       onSteer,
       onSubmit,
       queueCurrentDraft,
-      queueEdit: null,
+      queueEdit,
+      queueEditRef,
       queuedPrompts: queued ? [{ id: 'queued-1', text: 'first', attachments: [], queuedAt: 1 }] : [],
       sessionId: 'runtime-session',
       setComposerText: vi.fn(),
@@ -80,7 +92,7 @@ function renderSubmitHook({
     })
   )
 
-  return { clearDraft, hook, loadIntoComposer, onCancel, onSteer, onSubmit, queueCurrentDraft, stashAt }
+  return { clearDraft, hook, loadIntoComposer, onCancel, onSteer, onSubmit, queueCurrentDraft, queueEditRef, stashAt }
 }
 
 describe('useComposerSubmit busy-turn routing', () => {
@@ -246,10 +258,15 @@ describe('external composer submission', () => {
       })
     ).resolves.toBe(true)
 
-    expect(onSubmit).toHaveBeenCalledWith('recovered question', {
-      attachments: [],
-      composerScope: 'stored-session'
-    })
+    expect(onSubmit).toHaveBeenCalledWith(
+      'recovered question',
+      expect.objectContaining({
+        attachments: [],
+        composerScope: 'stored-session',
+        sessionId: 'runtime-session',
+        storedSessionId: 'stored-session'
+      })
+    )
     expect(clearDraft).not.toHaveBeenCalled()
     expect(loadIntoComposer).not.toHaveBeenCalled()
     expect(stashAt).not.toHaveBeenCalled()
@@ -276,6 +293,10 @@ describe('external composer submission', () => {
   it.each([
     ['busy', { busy: true }],
     ['queued', { queued: true }],
+    [
+      'editing the queue',
+      { queueEdit: { attachments: [], draft: 'queued draft', entryId: 'queued-1', sessionKey: 'stored-session' } }
+    ],
     ['reconnecting or disabled', { disabled: true }]
   ])('rejects an isolated submit while the addressed chat is %s', async (_label, options) => {
     const { onSubmit } = renderSubmitHook(options)
@@ -289,6 +310,44 @@ describe('external composer submission', () => {
       })
     ).resolves.toBe(false)
     expect(onSubmit).not.toHaveBeenCalled()
+  })
+
+  it('rechecks a queue edit after async middleware before native submit begins', async () => {
+    let releaseMiddleware!: () => void
+
+    const middleware = new Promise<void>(resolve => {
+      releaseMiddleware = resolve
+    })
+
+    const { onSubmit, queueEditRef } = renderSubmitHook()
+
+    onSubmit.mockImplementationOnce(async (_text, options) => {
+      await middleware
+
+      if (!options?.composerAdmission?.beginSubmit()) {
+        return false
+      }
+
+      return options.composerAdmission.commit()
+    })
+
+    const submission = requestComposerSubmit('do not jump the edit', {
+      expectedSession: { runtimeSessionId: 'runtime-session', storedSessionId: 'stored-session' },
+      preserveDraft: true,
+      requireIdle: true,
+      target: 'main'
+    })
+
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(1))
+    queueEditRef.current = {
+      attachments: [],
+      draft: 'queued draft',
+      entryId: 'queued-1',
+      sessionKey: 'stored-session'
+    }
+    releaseMiddleware()
+
+    await expect(submission).resolves.toBe(false)
   })
 
   it('rechecks the exact session identity after the deferred event dispatch', async () => {

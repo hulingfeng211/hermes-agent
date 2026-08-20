@@ -16,7 +16,9 @@ afterEach(() => {
 function ContextProbe() {
   const context = useComposerContext()
 
-  return <output>{`${context.runtimeSessionId ?? 'none'}:${context.storedSessionId ?? 'none'}`}</output>
+  return (
+    <output>{`${context.connectionId ?? 'local'}:${context.profile}:${context.runtimeSessionId ?? 'none'}:${context.storedSessionId ?? 'none'}`}</output>
+  )
 }
 
 function renderComposerSlot(context: ComposerContextValue) {
@@ -37,20 +39,37 @@ function renderComposerSlot(context: ComposerContextValue) {
 
 describe('composer contribution context', () => {
   it('scopes a render contribution to its owning ChatBar identity', () => {
-    renderComposerSlot({ runtimeSessionId: 'runtime-tile', storedSessionId: 'stored-tile-root' })
+    renderComposerSlot({
+      connectionId: 'corp-net',
+      profile: 'research',
+      runtimeSessionId: 'runtime-tile',
+      storedSessionId: 'stored-tile-root'
+    })
 
-    expect(screen.queryByText('runtime-tile:stored-tile-root')).not.toBeNull()
+    expect(screen.queryByText('corp-net:research:runtime-tile:stored-tile-root')).not.toBeNull()
   })
 
   it('updates a mounted contribution when its ChatBar target changes', () => {
-    const view = renderComposerSlot({ runtimeSessionId: 'runtime-a', storedSessionId: 'stored-a' })
+    const view = renderComposerSlot({
+      connectionId: null,
+      profile: 'default',
+      runtimeSessionId: 'runtime-a',
+      storedSessionId: 'stored-a'
+    })
 
     view.rerender(
-      <ComposerContextProvider value={{ runtimeSessionId: 'runtime-b', storedSessionId: 'stored-b' }}>
+      <ComposerContextProvider
+        value={{
+          connectionId: 'backend-b',
+          profile: 'finance',
+          runtimeSessionId: 'runtime-b',
+          storedSessionId: 'stored-b'
+        }}
+      >
         <Slot area={COMPOSER_AREAS.top} />
       </ComposerContextProvider>
     )
 
-    expect(screen.queryByText('runtime-b:stored-b')).not.toBeNull()
+    expect(screen.queryByText('backend-b:finance:runtime-b:stored-b')).not.toBeNull()
   })
 })

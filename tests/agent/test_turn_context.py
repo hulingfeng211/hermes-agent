@@ -258,6 +258,98 @@ def test_pre_llm_plugin_receives_resolved_endpoint_context(monkeypatch):
     }
 
 
+def test_pre_llm_plugin_receives_compression_stable_conversation_id(
+    monkeypatch, tmp_path
+):
+    """Hooks get the logical root alongside the current physical segment."""
+    from hermes_cli import plugins
+    from hermes_cli.plugins import PluginContext, PluginManifest, PluginManager
+
+    manager = PluginManager()
+    plugin_ctx = PluginContext(
+        PluginManifest(name="conversation-id", source="test", key="conversation-id"),
+        manager,
+    )
+    received = {}
+
+    def capture_hook(*, session_id, conversation_id, **_kwargs):
+        received.update(session_id=session_id, conversation_id=conversation_id)
+
+    plugin_ctx.register_hook("pre_llm_call", capture_hook)
+    monkeypatch.setattr(plugins, "_plugin_manager", manager)
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        db.create_session("conversation-root", source="webui")
+        db.end_session("conversation-root", "compression")
+        db.create_session(
+            "compression-tip",
+            source="webui",
+            parent_session_id="conversation-root",
+        )
+        agent = _FakeAgent()
+        agent.session_id = "compression-tip"
+        agent._session_db = db
+
+        _build(agent)
+    finally:
+        db.close()
+
+    assert received == {
+        "session_id": "compression-tip",
+        "conversation_id": "conversation-root",
+    }
+
+
+@pytest.mark.parametrize(
+    ("model_config", "source"),
+    [
+        ({"_branched_from": "conversation-root"}, "webui"),
+        ({"_delegate_from": "conversation-root"}, "webui"),
+        ({}, "tool"),
+    ],
+)
+def test_pre_llm_conversation_id_keeps_fork_children_isolated(
+    monkeypatch, tmp_path, model_config, source
+):
+    """The stable hook identity must not collapse real forks into a parent."""
+    from hermes_cli import plugins
+    from hermes_cli.plugins import PluginContext, PluginManifest, PluginManager
+
+    manager = PluginManager()
+    plugin_ctx = PluginContext(
+        PluginManifest(name="conversation-id", source="test", key="conversation-id"),
+        manager,
+    )
+    received = {}
+    plugin_ctx.register_hook(
+        "pre_llm_call",
+        lambda **kwargs: received.update(kwargs),
+    )
+    monkeypatch.setattr(plugins, "_plugin_manager", manager)
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        db.create_session("conversation-root", source="webui")
+        db.end_session("conversation-root", "compression")
+        db.create_session(
+            "fork-child",
+            source=source,
+            parent_session_id="conversation-root",
+            model_config=model_config,
+        )
+        agent = _FakeAgent()
+        agent.session_id = "fork-child"
+        agent._session_db = db
+
+        _build(agent)
+    finally:
+        db.close()
+
+    assert received["session_id"] == "fork-child"
+    assert received["conversation_id"] == "fork-child"
+
+
 def test_user_message_preserves_platform_event_timestamp():
     agent = _FakeAgent()
 

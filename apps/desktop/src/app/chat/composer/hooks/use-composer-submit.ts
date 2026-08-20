@@ -9,8 +9,10 @@ import { enqueueQueuedPrompt, type QueuedPromptEntry } from '@/store/composer-qu
 import { hasMcpSetupRequest, skipMcpSetupRequest } from '@/store/mcp-setup'
 import { hasBlockingPromptRequest } from '@/store/prompts'
 
+import type { ComposerSubmitAdmission, ComposerSubmitAdmissionPhase } from '../admission'
 import { cloneAttachments, type QueueEditState } from '../composer-utils'
-import { onComposerSubmitRequest } from '../focus'
+import type { ComposerContextValue } from '../contrib'
+import { type ComposerSessionSnapshot, onComposerSubmitRequest } from '../focus'
 import { pathifyRefs } from '../path-refs'
 import { composerPlainText } from '../rich-editor'
 import { useComposerScope } from '../scope'
@@ -22,6 +24,7 @@ interface UseComposerSubmitArgs {
   attachments: ComposerAttachment[]
   busy: boolean
   compacting: boolean
+  composerContext: ComposerContextValue
   clearDraft: () => void
   disabled: boolean
   draftRef: RefObject<string>
@@ -36,6 +39,7 @@ interface UseComposerSubmitArgs {
   onSubmit: ChatBarProps['onSubmit']
   queueCurrentDraft: () => boolean
   queueEdit: QueueEditState | null
+  queueEditRef: RefObject<QueueEditState | null>
   queuedPrompts: QueuedPromptEntry[]
   sessionId: string | null | undefined
   setComposerText: (value: string) => void
@@ -57,6 +61,7 @@ export function useComposerSubmit({
   attachments,
   busy,
   compacting,
+  composerContext,
   clearDraft,
   disabled,
   draftRef,
@@ -71,6 +76,7 @@ export function useComposerSubmit({
   onSubmit,
   queueCurrentDraft,
   queueEdit,
+  queueEditRef,
   queuedPrompts,
   sessionId,
   setComposerText,
@@ -83,7 +89,9 @@ export function useComposerSubmit({
   const dispatchSubmit = async (
     text: string,
     attachments?: ComposerAttachment[],
-    displayKind?: 'hidden'
+    displayKind?: 'hidden',
+    composerAdmission?: ComposerSubmitAdmission,
+    expectedSession?: ComposerSessionSnapshot
   ): Promise<boolean> => {
     const submittedScope = activeQueueSessionKeyRef.current
     const submittedAttachments = attachments ?? []
@@ -100,8 +108,23 @@ export function useComposerSubmit({
     try {
       const accepted = await Promise.resolve(
         attachments
-          ? onSubmit(text, { attachments, composerScope: submittedScope, ...(displayKind ? { displayKind } : {}) })
-          : onSubmit(text, { composerScope: submittedScope, ...(displayKind ? { displayKind } : {}) })
+          ? onSubmit(text, {
+              attachments,
+              composerScope: submittedScope,
+              ...(composerAdmission ? { composerAdmission } : {}),
+              ...(displayKind ? { displayKind } : {}),
+              ...(expectedSession
+                ? { sessionId: expectedSession.runtimeSessionId, storedSessionId: expectedSession.storedSessionId }
+                : {})
+            })
+          : onSubmit(text, {
+              composerScope: submittedScope,
+              ...(composerAdmission ? { composerAdmission } : {}),
+              ...(displayKind ? { displayKind } : {}),
+              ...(expectedSession
+                ? { sessionId: expectedSession.runtimeSessionId, storedSessionId: expectedSession.storedSessionId }
+                : {})
+            })
       )
 
       if (accepted === false) {
@@ -126,64 +149,204 @@ export function useComposerSubmit({
   const dispatchSubmitRef = useRef(dispatchSubmit)
   dispatchSubmitRef.current = dispatchSubmit
 
-  useEffect(
-    () =>
-      onComposerSubmitRequest(
-        ({ claim, displayKind, expectedSession, preserveDraft, requireIdle, resolve, target, text }) => {
-          if (target !== scope.target) {
-            return
+  const onSubmitRef = useRef(onSubmit)
+  onSubmitRef.current = onSubmit
+
+  const externalStateRef = useRef({
+    busy,
+    composerContext,
+    disabled,
+    inputDisabled,
+    queuedCount: queuedPrompts.length,
+    target: scope.target
+  })
+
+  externalStateRef.current = {
+    busy,
+    composerContext,
+    disabled,
+    inputDisabled,
+    queuedCount: queuedPrompts.length,
+    target: scope.target
+  }
+
+  const activeExternalClaimsRef = useRef(new Set<{ cancel: () => void; isValid: () => boolean }>())
+
+  // React-local admission edges (queue edit in particular) are not visible to
+  // the SDK's store guard. Cancel any in-flight middleware as soon as one of
+  // those edges invalidates its claim.
+  useEffect(() => {
+    for (const active of activeExternalClaimsRef.current) {
+      if (!active.isValid()) {
+        active.cancel()
+      }
+    }
+  }, [activeQueueSessionKey, busy, composerContext, disabled, inputDisabled, queueEdit, queuedPrompts.length])
+
+  useEffect(() => {
+    const activeClaims = activeExternalClaimsRef.current
+
+    const stop = onComposerSubmitRequest(
+      ({
+        admission,
+        cancel,
+        claim,
+        displayKind,
+        expectedSession,
+        preserveDraft,
+        requireIdle,
+        resolve,
+        target,
+        text
+      }) => {
+        if (target !== scope.target) {
+          return
+        }
+
+        const submittedScope = activeQueueSessionKeyRef.current
+
+        const matchesExpectedSession = () => {
+          if (!expectedSession) {
+            return true
           }
 
-          const submittedScope = activeQueueSessionKeyRef.current
+          const context = externalStateRef.current.composerContext
+
+          return (
+            expectedSession.runtimeSessionId === context.runtimeSessionId &&
+            expectedSession.storedSessionId === activeQueueSessionKeyRef.current &&
+            (expectedSession.profile === undefined || expectedSession.profile === context.profile) &&
+            (expectedSession.connectionId === undefined || expectedSession.connectionId === context.connectionId)
+          )
+        }
+
+        if (!matchesExpectedSession() || !admission.isValid()) {
+          return
+        }
+
+        if (!claim()) {
+          return
+        }
+
+        let submitBegun = false
+
+        const validForPhase = (phase: ComposerSubmitAdmissionPhase) => {
+          const current = externalStateRef.current
 
           if (
-            expectedSession &&
-            (expectedSession.runtimeSessionId !== sessionId || expectedSession.storedSessionId !== submittedScope)
+            current.target !== target ||
+            activeQueueSessionKeyRef.current !== submittedScope ||
+            !matchesExpectedSession() ||
+            !admission.isValid() ||
+            current.inputDisabled
           ) {
-            return
+            return false
           }
 
-          if (!claim()) {
-            return
+          if (
+            requireIdle &&
+            (current.disabled ||
+              current.queuedCount > 0 ||
+              Boolean(queueEditRef.current) ||
+              (phase === 'admission' && current.busy))
+          ) {
+            return false
           }
 
-          if (inputDisabled || (requireIdle && (disabled || busy || queuedPrompts.length > 0 || Boolean(queueEdit)))) {
-            resolve(false)
-
-            return
-          }
-
-          if (preserveDraft) {
-            void Promise.resolve(
-              onSubmit(text, {
-                attachments: [],
-                composerScope: submittedScope,
-                ...(displayKind ? { displayKind } : {})
-              })
-            )
-              .then(accepted => resolve(accepted !== false))
-              .catch(() => resolve(false))
-
-            return
-          }
-
-          // Legacy external actions still restore their own text on rejection,
-          // but must never borrow attachments currently staged by the user.
-          void dispatchSubmitRef.current(text, [], displayKind).then(resolve)
+          return true
         }
-      ),
-    [
-      activeQueueSessionKeyRef,
-      busy,
-      disabled,
-      inputDisabled,
-      onSubmit,
-      queueEdit,
-      queuedPrompts.length,
-      scope.target,
-      sessionId
-    ]
-  )
+
+        const active = {
+          cancel: () => {
+            activeClaims.delete(active)
+            cancel()
+          },
+          isValid: () => validForPhase(submitBegun ? 'submitting' : 'admission')
+        }
+
+        const admittedSubmit: ComposerSubmitAdmission = {
+          signal: admission.signal,
+          beginSubmit: () => {
+            if (submitBegun) {
+              return validForPhase('submitting')
+            }
+
+            if (!validForPhase('admission') || !admission.beginSubmit()) {
+              active.cancel()
+
+              return false
+            }
+
+            submitBegun = true
+
+            return validForPhase('submitting')
+          },
+          isValid: active.isValid,
+          commit: () => {
+            if (!submitBegun || !validForPhase('submitting') || !admission.commit()) {
+              active.cancel()
+
+              return false
+            }
+
+            activeClaims.delete(active)
+
+            return true
+          }
+        }
+
+        const finish = (accepted: boolean) => {
+          activeClaims.delete(active)
+          resolve(accepted)
+        }
+
+        activeClaims.add(active)
+        admission.signal.addEventListener('abort', () => activeClaims.delete(active), {
+          once: true
+        })
+
+        // Re-read every edge after claim: the SDK guard subscription and
+        // this listener are installed on different stacks.
+        if (!active.isValid()) {
+          active.cancel()
+
+          return
+        }
+
+        if (preserveDraft) {
+          void Promise.resolve(
+            onSubmitRef.current(text, {
+              attachments: [],
+              composerScope: submittedScope,
+              composerAdmission: admittedSubmit,
+              ...(displayKind ? { displayKind } : {}),
+              ...(expectedSession
+                ? { sessionId: expectedSession.runtimeSessionId, storedSessionId: expectedSession.storedSessionId }
+                : {})
+            })
+          )
+            .then(accepted => finish(accepted !== false))
+            .catch(() => finish(false))
+
+          return
+        }
+
+        // Legacy external actions still restore their own text on rejection,
+        // but must never borrow attachments currently staged by the user.
+        void dispatchSubmitRef.current(text, [], displayKind, admittedSubmit, expectedSession).then(finish)
+      }
+    )
+
+    return () => {
+      stop()
+
+      for (const active of activeClaims) {
+        active.cancel()
+      }
+
+      activeClaims.clear()
+    }
+  }, [activeQueueSessionKeyRef, queueEditRef, scope.target])
 
   const submitDraft = () => {
     if (disabled) {

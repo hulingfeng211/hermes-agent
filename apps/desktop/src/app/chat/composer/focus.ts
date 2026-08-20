@@ -13,6 +13,7 @@
 import { queryAllVisible, queryVisible } from '@/components/pane-shell/pane-visibility'
 import { $hoveredTreeGroup } from '@/components/pane-shell/tree/store'
 
+import type { ComposerSubmitAdmission, ComposerSubmitAdmissionPhase } from './admission'
 import type { InlineRefInput } from './inline-refs'
 import { RICH_INPUT_SLOT } from './rich-editor'
 
@@ -51,6 +52,8 @@ const SUBMIT_EVENT = 'hermes:composer-submit'
 const VOICE_TOGGLE_EVENT = 'hermes:composer-voice-toggle'
 const MODEL_MENU_EVENT = 'hermes:composer-model-menu'
 
+export const COMPOSER_SUBMIT_ADMISSION_TIMEOUT_MS = 5 * 60 * 1000
+
 /** Inline edit composer root — mounted only while a user bubble is being edited. */
 const EDIT_COMPOSER_ROOT = '[data-slot="aui_edit-composer-root"]'
 
@@ -66,17 +69,29 @@ const cssEscape = (value: string): string => {
   return value.replace(/[^a-zA-Z0-9_:-]/g, ch => `\\${ch}`)
 }
 
+export interface ComposerSessionSnapshot {
+  connectionId?: null | string
+  profile?: null | string
+  runtimeSessionId: string
+  storedSessionId: string
+}
+
+export interface ComposerSubmitGuard {
+  isValid: (phase: ComposerSubmitAdmissionPhase) => boolean
+  subscribe?: (onMaybeInvalid: () => void) => () => void
+}
+
 interface SubmitDetail {
   /** First exact listener wins. A non-matching listener must not claim. */
   claim: () => boolean
+  /** Cancel a claimed request. A committed gateway send cannot be cancelled. */
+  cancel: () => void
+  admission: ComposerSubmitAdmission
   resolve: (accepted: boolean) => void
   target: ComposerTarget
   text: string
   /** Re-check identity in the addressed ChatBar after the deferred dispatch. */
-  expectedSession?: {
-    runtimeSessionId: string
-    storedSessionId: string
-  }
+  expectedSession?: ComposerSessionSnapshot
   /** External intent must not consume or overwrite the user's live draft. */
   preserveDraft?: boolean
   /** Reject instead of steering or jumping ahead of an existing queue. */
@@ -280,12 +295,14 @@ export const requestComposerSubmit = (
     target = 'active',
     displayKind,
     expectedSession,
+    guard,
     preserveDraft,
     requireIdle
   }: {
     target?: ComposerTarget | 'active'
     displayKind?: 'hidden'
     expectedSession?: SubmitDetail['expectedSession']
+    guard?: ComposerSubmitGuard
     preserveDraft?: boolean
     requireIdle?: boolean
   } = {}
@@ -298,7 +315,22 @@ export const requestComposerSubmit = (
 
   return new Promise(resolveSubmit => {
     let claimed = false
+    let committed = false
+    let phase: ComposerSubmitAdmissionPhase = 'admission'
     let settled = false
+    let stopGuard: (() => void) | undefined
+    let timeout: number | undefined
+    const abortController = new AbortController()
+
+    const cleanup = () => {
+      stopGuard?.()
+      stopGuard = undefined
+
+      if (timeout !== undefined) {
+        window.clearTimeout(timeout)
+        timeout = undefined
+      }
+    }
 
     const settle = (accepted: boolean) => {
       if (settled) {
@@ -306,20 +338,95 @@ export const requestComposerSubmit = (
       }
 
       settled = true
+      cleanup()
       resolveSubmit(accepted)
     }
 
+    const guardIsValid = () => !abortController.signal.aborted && (guard?.isValid(phase) ?? true)
+
+    const cancel = () => {
+      if (committed || settled) {
+        return
+      }
+
+      abortController.abort()
+      settle(false)
+    }
+
+    const checkGuard = () => {
+      if (!guardIsValid()) {
+        cancel()
+      }
+    }
+
+    const admission: ComposerSubmitAdmission = {
+      signal: abortController.signal,
+      beginSubmit: () => {
+        if (committed || settled || !guardIsValid()) {
+          cancel()
+
+          return false
+        }
+
+        phase = 'submitting'
+        checkGuard()
+
+        return !settled
+      },
+      isValid: guardIsValid,
+      commit: () => {
+        if (committed) {
+          return true
+        }
+
+        if (settled || !guardIsValid()) {
+          cancel()
+
+          return false
+        }
+
+        committed = true
+        cleanup()
+
+        return true
+      }
+    }
+
     const claim = () => {
-      if (claimed || settled) {
+      if (claimed || settled || !guardIsValid()) {
+        checkGuard()
+
         return false
       }
 
       claimed = true
 
-      return true
+      // Install the bound before subscribing: a guard implementation may
+      // synchronously report invalidation (or throw) during subscription.
+      // Either path must still clean up and settle this claim.
+      timeout = window.setTimeout(cancel, COMPOSER_SUBMIT_ADMISSION_TIMEOUT_MS)
+
+      if (guard?.subscribe) {
+        try {
+          stopGuard = guard.subscribe(checkGuard)
+        } catch {
+          cancel()
+
+          return false
+        }
+      }
+
+      // An async middleware must not leave an SDK call pending forever. The
+      // abort signal also makes the ChatBar stop waiting, so a timed-out claim
+      // cannot later fall through to prompt.submit.
+      checkGuard()
+
+      return !settled
     }
 
     dispatch<SubmitDetail>(SUBMIT_EVENT, {
+      admission,
+      cancel,
       claim,
       resolve: settle,
       target: resolve(target),
@@ -332,8 +439,9 @@ export const requestComposerSubmit = (
 
     // `dispatch` runs one macrotask earlier. If no exact listener claimed the
     // request during that event, fail on the next task. Once claimed, the
-    // caller follows the real async submit result; no timeout may report false
-    // while middleware or the gateway is still going to send.
+    // caller follows the real async submit result. A claimed request has its
+    // own aborting admission deadline above, so a timeout can never report
+    // false while middleware is still allowed to send later.
     window.setTimeout(() => {
       if (!claimed) {
         settle(false)

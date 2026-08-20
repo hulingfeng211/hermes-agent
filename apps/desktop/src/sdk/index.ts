@@ -21,7 +21,7 @@
 import { atom, computed, type ReadableAtom } from 'nanostores'
 import type { ReactNode } from 'react'
 
-import { requestComposerSubmit } from '@/app/chat/composer/focus'
+import { type ComposerSubmitGuard, requestComposerSubmit } from '@/app/chat/composer/focus'
 import { PRIMARY_SESSION_VIEW } from '@/app/chat/session-view'
 import { openSession, type OpenSessionIntent } from '@/app/open-session'
 import type { ClientSessionState } from '@/app/types'
@@ -121,6 +121,10 @@ export interface PluginProfileRoute {
 
 /** Exact ChatBar identity for a plugin-initiated native text submission. */
 export interface PluginComposerTarget {
+  /** Registry source captured from ComposerContextValue; null when unavailable. */
+  connectionId?: null | string
+  /** Canonical backend profile captured from ComposerContextValue. */
+  profile?: null | string
   runtimeSessionId: string | null
   storedSessionId: string | null
 }
@@ -166,22 +170,71 @@ const $queuedPromptCountBySession = computed($queuedPromptsBySession, queues => 
 const $viewport = atom<ViewportRect>(readViewport())
 
 interface ResolvedPluginComposerTarget {
+  backend: ComposerBackendSnapshot
+  connectionId: null | string
+  profile: string
   runtimeSessionId: string
   storedSessionId: string
   target: string
 }
 
+interface ComposerBackendSnapshot {
+  connectionFingerprint: string
+  connectionId: null | string
+  profile: string
+}
+
+const normalizeComposerConnectionId = (value: null | string | undefined): null | string => {
+  const id = value?.trim()
+
+  return id || null
+}
+
+/** The backend identity behind the currently active composer route. Registry
+ * ids are authoritative when present; the descriptor fingerprint keeps legacy
+ * URL/SSH primaries distinct even though their public connection id is null. */
+const activeComposerBackend = (): ComposerBackendSnapshot => {
+  const connection = $connection.get()
+  const connectionId = normalizeComposerConnectionId(activeGatewayConnectionId() ?? connection?.connectionId)
+
+  const connectionFingerprint = connectionId
+    ? `registry:${connectionId}`
+    : connection?.mode === 'remote'
+      ? `remote:${connection.baseUrl}|${connection.profile ?? ''}|${connection.remoteIdentity ?? ''}`
+      : 'local'
+
+  return {
+    connectionFingerprint,
+    connectionId,
+    profile: normalizeProfileKey($activeGatewayProfile.get())
+  }
+}
+
+const sameComposerBackend = (left: ComposerBackendSnapshot, right: ComposerBackendSnapshot): boolean =>
+  left.connectionFingerprint === right.connectionFingerprint &&
+  left.connectionId === right.connectionId &&
+  left.profile === right.profile
+
 const composerTargetForSession = ({
+  connectionId,
+  profile,
   runtimeSessionId,
   storedSessionId
 }: PluginComposerTarget): null | ResolvedPluginComposerTarget => {
   const runtime = runtimeSessionId?.trim() || null
   const stored = storedSessionId?.trim() || null
+  const backend = activeComposerBackend()
+
+  const expectedBackend: ComposerBackendSnapshot = {
+    connectionFingerprint: backend.connectionFingerprint,
+    connectionId: connectionId === undefined ? backend.connectionId : normalizeComposerConnectionId(connectionId),
+    profile: profile === undefined ? backend.profile : normalizeProfileKey(profile)
+  }
 
   // Both halves are required. A runtime id alone can be recycled after resume;
   // a stored id alone can point at a different live incarnation after an async
   // action returns. Their pair is the ChatBar identity snapshot.
-  if (!runtime || !stored) {
+  if (!runtime || !stored || !sameComposerBackend(backend, expectedBackend)) {
     return null
   }
 
@@ -190,23 +243,106 @@ const composerTargetForSession = ({
   const sessions = $sessions.get()
   const primaryComposerKey = resolveComposerSessionKey(primaryStored, sessions)
 
-  if (runtime === primaryRuntime && stored === primaryComposerKey) {
-    return { runtimeSessionId: runtime, storedSessionId: stored, target: 'main' }
-  }
+  const primaryMatches = runtime === primaryRuntime && stored === primaryComposerKey
 
-  const tile = $sessionTiles.get().find(candidate => {
+  const matchingTiles = $sessionTiles.get().filter(candidate => {
     if (resolveComposerSessionKey(candidate.storedSessionId, sessions) !== stored) {
       return false
     }
 
-    if (candidate.runtimeId !== runtime) {
+    return candidate.runtimeId === runtime
+  })
+
+  // Runtime + stored identity names a conversation, not a renderer surface.
+  // Refuse an ambiguous match instead of guessing between main and a tile (or
+  // between duplicate tiles), because guessing can submit through the wrong
+  // ChatBar and survive disposal of the surface the caller actually targeted.
+  if ((primaryMatches ? 1 : 0) + matchingTiles.length !== 1) {
+    return null
+  }
+
+  if (primaryMatches) {
+    return {
+      backend,
+      connectionId: backend.connectionId,
+      profile: backend.profile,
+      runtimeSessionId: runtime,
+      storedSessionId: stored,
+      target: 'main'
+    }
+  }
+
+  const [tile] = matchingTiles
+
+  return tile
+    ? {
+        backend,
+        connectionId: backend.connectionId,
+        profile: backend.profile,
+        runtimeSessionId: runtime,
+        storedSessionId: stored,
+        target: `tile:${tile.storedSessionId}`
+      }
+    : null
+}
+
+const composerSubmitGuard = (resolved: ResolvedPluginComposerTarget): ComposerSubmitGuard => {
+  const isValid: ComposerSubmitGuard['isValid'] = phase => {
+    if ($gatewayState.get() !== 'open' || !sameComposerBackend(activeComposerBackend(), resolved.backend)) {
       return false
     }
 
-    return true
-  })
+    const current = composerTargetForSession({
+      connectionId: resolved.connectionId,
+      profile: resolved.profile,
+      runtimeSessionId: resolved.runtimeSessionId,
+      storedSessionId: resolved.storedSessionId
+    })
 
-  return tile ? { runtimeSessionId: runtime, storedSessionId: stored, target: `tile:${tile.storedSessionId}` } : null
+    if (!current || current.target !== resolved.target || !sameComposerBackend(current.backend, resolved.backend)) {
+      return false
+    }
+
+    // A queue stays authoritative through native submit preparation. Busy is
+    // checked only through middleware admission because the submit pipeline
+    // publishes its own optimistic busy edge before the gateway RPC.
+    if (($queuedPromptsBySession.get()[resolved.storedSessionId]?.length ?? 0) > 0) {
+      return false
+    }
+
+    if (phase === 'admission') {
+      const sessionBusy = Boolean($sessionStates.get()[resolved.runtimeSessionId]?.busy)
+      const primaryBusy = resolved.target === 'main' && PRIMARY_SESSION_VIEW.$busy.get()
+
+      if (sessionBusy || primaryBusy) {
+        return false
+      }
+    }
+
+    return true
+  }
+
+  return {
+    isValid,
+    subscribe: onMaybeInvalid => {
+      const check = () => onMaybeInvalid()
+
+      const stops = [
+        $activeGatewayProfile.listen(check),
+        $activeSessionId.listen(check),
+        $connection.listen(check),
+        $gatewayState.listen(check),
+        $queuedPromptsBySession.listen(check),
+        $selectedStoredSessionId.listen(check),
+        $sessions.listen(check),
+        $sessionStates.listen(check),
+        $sessionTiles.listen(check),
+        PRIMARY_SESSION_VIEW.$busy.listen(check)
+      ]
+
+      return () => stops.forEach(stop => stop())
+    }
+  }
 }
 
 async function requestPluginProfile<T>(
@@ -432,19 +568,20 @@ export const host = {
       return false
     }
 
-    const sessionBusy = Boolean($sessionStates.get()[resolved.runtimeSessionId]?.busy)
-    const primaryBusy = resolved.target === 'main' && PRIMARY_SESSION_VIEW.$busy.get()
-    const queued = Boolean($queuedPromptCountBySession.get()[resolved.storedSessionId])
+    const guard = composerSubmitGuard(resolved)
 
-    if (sessionBusy || primaryBusy || queued) {
+    if (!guard.isValid('admission')) {
       return false
     }
 
     return requestComposerSubmit(text, {
       expectedSession: {
+        connectionId: resolved.connectionId,
+        profile: resolved.profile,
         runtimeSessionId: resolved.runtimeSessionId,
         storedSessionId: resolved.storedSessionId
       },
+      guard,
       preserveDraft: true,
       requireIdle: true,
       target: resolved.target
@@ -818,7 +955,10 @@ export {
   type ComposerAtCompletionSource,
   type ComposerAttachmentProvider,
   type ComposerContextValue,
+  type ComposerDraft,
   type ComposerMiddleware,
+  type ComposerMiddlewareOutput,
+  type ComposerMiddlewareResult,
   useComposerContext
 } from '@/app/chat/composer/contrib'
 

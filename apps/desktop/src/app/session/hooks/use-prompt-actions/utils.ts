@@ -1,5 +1,6 @@
 import type { AppendMessage } from '@assistant-ui/react'
 
+import type { ComposerSubmitAdmission } from '@/app/chat/composer/admission'
 import { translateNow, type Translations } from '@/i18n'
 import type { ChatMessage } from '@/lib/chat-messages'
 import { type CommandsCatalogLike, filterDesktopCommandsCatalog } from '@/lib/desktop-slash-commands'
@@ -648,8 +649,36 @@ export function visibleUserIndexAtOrdinal(messages: readonly ChatMessage[], targ
   return targetOrdinal >= 0 && targetOrdinal < indices.length ? indices[targetOrdinal] : -1
 }
 
+/** Wrap a renderer-local commit receipt at the boundary that owns retries.
+ * A callback failure cannot undo an already-admitted turn. */
+export function oneShotComposerAdmission(callback?: () => void): (() => void) | undefined {
+  if (!callback) {
+    return undefined
+  }
+
+  let committed = false
+
+  return () => {
+    if (committed) {
+      return
+    }
+
+    committed = true
+
+    try {
+      callback()
+    } catch {
+      // Admission is authoritative; plugin cleanup cannot veto the turn.
+    }
+  }
+}
+
 export interface SubmitTextOptions {
   attachments?: ComposerAttachment[]
+  /** @internal One-shot authority carried by external composer submissions. */
+  composerAdmission?: ComposerSubmitAdmission
+  /** @internal One-shot renderer-local middleware receipt. Never forwarded. */
+  commitComposerAdmission?: () => void
   /** The composer scope key that was actually loaded when this text was
    *  submitted (see use-composer-draft's activeQueueSessionKeyRef). Compared
    *  against the resolved submit target in sessionContextDrift — a mismatch

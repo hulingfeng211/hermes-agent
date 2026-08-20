@@ -15,17 +15,21 @@ import { triggerHaptic } from '@/lib/haptics'
 import { cn } from '@/lib/utils'
 import { interceptsTypedVoiceStop } from '@/lib/voice-stop-word'
 import { sessionCompacting } from '@/store/compaction'
+import type { ComposerAttachment } from '@/store/composer'
 import { browseBackward, browseForward, deriveUserHistory, isBrowsingHistory } from '@/store/composer-input-history'
 import { POPOUT_WIDTH_REM } from '@/store/composer-popout'
 import { parkQueuedPrompts, removeQueuedPrompt, unparkQueuedPrompts } from '@/store/composer-queue'
+import { activeGatewayConnectionId } from '@/store/gateway'
 import { $hudMode } from '@/store/hud'
+import { $activeGatewayProfile, normalizeProfileKey } from '@/store/profile'
 import { sessionBlockingPrompt } from '@/store/prompts'
 import { toggleReview } from '@/store/review'
-import { $gatewayState } from '@/store/session'
+import { $connection, $gatewayState } from '@/store/session'
 import { $threadScrolledUp } from '@/store/thread-scroll'
 import { $autoSpeakReplies } from '@/store/voice-prefs'
 import { useTheme } from '@/themes'
 
+import type { ComposerSubmitAdmission } from './admission'
 import { AttachmentList } from './attachments'
 import {
   acceptsTriggerCompletion,
@@ -34,7 +38,13 @@ import {
   slashArgStage
 } from './composer-utils'
 import { ContextMenu } from './context-menu'
-import { COMPOSER_AREAS, ComposerContextProvider, type ComposerContextValue, runComposerMiddleware } from './contrib'
+import {
+  COMPOSER_AREAS,
+  ComposerContextProvider,
+  type ComposerContextValue,
+  type PreparedComposerDraft,
+  runComposerMiddleware
+} from './contrib'
 import { ComposerControls } from './controls'
 import { ComposerDirectiveActions } from './directive-actions'
 import { COMPOSER_DROP_ACTIVE_CLASS, COMPOSER_DROP_FADE_CLASS } from './drop-affordance'
@@ -87,6 +97,44 @@ interface ComposerContextSlotProps {
   value: ComposerContextValue
 }
 
+const MIDDLEWARE_ADMISSION_CANCELLED = Symbol('middleware-admission-cancelled')
+
+async function runAdmittedComposerMiddleware(
+  value: string,
+  attachments: ComposerAttachment[] | undefined,
+  context: ComposerContextValue,
+  admission?: ComposerSubmitAdmission
+): Promise<PreparedComposerDraft | null | typeof MIDDLEWARE_ADMISSION_CANCELLED> {
+  if (admission && !admission.isValid()) {
+    return MIDDLEWARE_ADMISSION_CANCELLED
+  }
+
+  const middleware = runComposerMiddleware({ text: value, attachments }, context)
+
+  if (!admission) {
+    return middleware
+  }
+
+  let onAbort: (() => void) | undefined
+
+  const cancelled = new Promise<typeof MIDDLEWARE_ADMISSION_CANCELLED>(resolve => {
+    onAbort = () => resolve(MIDDLEWARE_ADMISSION_CANCELLED)
+    admission.signal.addEventListener('abort', onAbort, { once: true })
+
+    if (admission.signal.aborted) {
+      onAbort()
+    }
+  })
+
+  try {
+    return await Promise.race([middleware, cancelled])
+  } finally {
+    if (onAbort) {
+      admission.signal.removeEventListener('abort', onAbort)
+    }
+  }
+}
+
 function ComposerContextSlot({ area, value }: ComposerContextSlotProps) {
   return (
     <ComposerContextProvider value={value}>
@@ -128,16 +176,20 @@ export function ChatBar({
   // is created first); render-time assignment keeps the ref current.
   const voiceStopRef = useRef<{ active: boolean; end: () => void }>({ active: false, end: () => {} })
   const activeQueueSessionKey = queueSessionKey || sessionId || null
+  const activeGatewayProfile = useStore($activeGatewayProfile)
+  const activeConnection = useStore($connection)
 
   const composerContext = useMemo<ComposerContextValue>(
     () =>
       Object.freeze({
+        connectionId: (activeGatewayConnectionId() ?? activeConnection?.connectionId?.trim()) || null,
+        profile: normalizeProfileKey(activeGatewayProfile),
         runtimeSessionId: sessionId ?? null,
         // `queueSessionKey` is already resolved to the durable lineage root;
         // do not substitute the runtime fallback used only for queue storage.
         storedSessionId: queueSessionKey ?? null
       }),
-    [queueSessionKey, sessionId]
+    [activeConnection, activeGatewayProfile, queueSessionKey, sessionId]
   )
 
   // Every send (typed, queued, voice) passes through the contributed
@@ -160,13 +212,43 @@ export function ChatBar({
         return true
       }
 
-      const draft = await runComposerMiddleware({ text: value, attachments: options?.attachments }, composerContext)
+      const inputAttachments = options?.attachments
 
-      if (!draft) {
+      const attachmentsWereExplicit = Boolean(options && Object.prototype.hasOwnProperty.call(options, 'attachments'))
+
+      const prepared = await runAdmittedComposerMiddleware(
+        value,
+        inputAttachments,
+        composerContext,
+        options?.composerAdmission
+      )
+
+      if (prepared === MIDDLEWARE_ADMISSION_CANCELLED || !prepared) {
         return false
       }
 
-      return onSubmitProp(draft.text, { ...options, attachments: draft.attachments })
+      const admission = options?.composerAdmission
+
+      // This is the final pre-submit admission edge. Recheck after every async
+      // middleware, then move the token into submit preparation before the
+      // native pipeline can paint optimistic busy state of its own.
+      if (admission && (!admission.isValid() || !admission.beginSubmit())) {
+        return false
+      }
+
+      const draft = prepared.draft
+
+      // An explicit empty attachment set means "do not touch the live draft".
+      // A middleware may legitimately return only `{ text }`; preserve the
+      // caller's explicit [] instead of turning it into undefined (which the
+      // native submit path interprets as "read current composer attachments").
+      const nextAttachments = draft.attachments ?? (attachmentsWereExplicit ? (inputAttachments ?? []) : undefined)
+
+      return onSubmitProp(draft.text, {
+        ...options,
+        attachments: nextAttachments,
+        ...(prepared.commit ? { commitComposerAdmission: prepared.commit } : {})
+      })
     },
     [composerContext, onSubmitProp]
   )
@@ -377,6 +459,7 @@ export function ChatBar({
     attachments,
     busy,
     compacting,
+    composerContext,
     clearDraft,
     disabled,
     draftRef,
@@ -393,6 +476,7 @@ export function ChatBar({
     onSubmit,
     queueCurrentDraft,
     queueEdit,
+    queueEditRef,
     queuedPrompts,
     sessionId,
     setComposerText,

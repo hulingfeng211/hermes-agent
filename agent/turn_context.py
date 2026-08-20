@@ -1171,10 +1171,21 @@ def build_turn_context(
     # Plugin hook: pre_llm_call (context injected into user message, not system prompt).
     plugin_user_context = ""
     try:
+        from agent.prompt_cache_scope import resolve_prompt_cache_scope_safe
         from hermes_cli.lifecycle import invoke_hook as _invoke_hook
+
+        # A plugin often needs one logical conversation identity across legacy
+        # compression rotations, while ``session_id`` must continue to expose
+        # the physical segment for existing consumers.  Reuse the prompt-cache
+        # scope resolver: its lineage walk is rotation-stable but deliberately
+        # keeps branches, delegates, and tool children isolated.
+        _conversation_id = (
+            resolve_prompt_cache_scope_safe(agent) or agent.session_id or ""
+        )
         _pre_results = _invoke_hook(
             "pre_llm_call",
             session_id=agent.session_id,
+            conversation_id=_conversation_id,
             task_id=effective_task_id,
             turn_id=turn_id,
             user_message=original_user_message,

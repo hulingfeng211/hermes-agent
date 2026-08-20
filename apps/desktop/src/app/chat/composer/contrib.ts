@@ -49,11 +49,17 @@ export interface ComposerDraft {
  *  is the composer's durable queue key (normally the stored lineage root),
  *  while `runtimeSessionId` is the live gateway session serving that view. */
 export interface ComposerContextValue {
+  /** Registry source serving this composer; null when the route has no registry id. */
+  readonly connectionId: string | null
+  /** Canonical backend profile serving this composer. */
+  readonly profile: string
   readonly runtimeSessionId: string | null
   readonly storedSessionId: string | null
 }
 
 const EMPTY_COMPOSER_CONTEXT: ComposerContextValue = Object.freeze({
+  connectionId: null,
+  profile: 'default',
   runtimeSessionId: null,
   storedSessionId: null
 })
@@ -63,13 +69,32 @@ const ComposerContext = createContext<ComposerContextValue>(EMPTY_COMPOSER_CONTE
 /** Scopes render contributions to the ChatBar instance they are mounted in. */
 export const ComposerContextProvider = ComposerContext.Provider
 
-/** Read the current ChatBar's runtime + durable queue identity. */
+/** Read the current ChatBar's backend, runtime, and durable queue identity. */
 export const useComposerContext = (): ComposerContextValue => useContext(ComposerContext)
 
 /** Payload of a `composer.middleware` data contribution. */
+export interface ComposerMiddlewareResult {
+  /** The transformed draft to pass to the rest of the middleware chain. */
+  draft: ComposerDraft
+  /** Runs once, only after this operation reaches the gateway-send boundary. */
+  onCommit?: () => void
+}
+
+export interface PreparedComposerDraft {
+  draft: ComposerDraft
+  /** One-shot aggregate of the middleware callbacks that requested commit. */
+  commit?: () => void
+}
+
+export type ComposerMiddlewareOutput = ComposerDraft | ComposerMiddlewareResult | null
+
 export interface ComposerMiddleware {
-  /** Rewrite (return a draft), pass through (same draft), or cancel (null). */
-  handler: (draft: ComposerDraft, context: ComposerContextValue) => ComposerDraft | null | Promise<ComposerDraft | null>
+  /** Rewrite/pass through with a draft, cancel with null, or return
+   * `{ draft, onCommit }` to defer a side effect until send admission. */
+  handler: (
+    draft: ComposerDraft,
+    context: ComposerContextValue
+  ) => ComposerMiddlewareOutput | Promise<ComposerMiddlewareOutput>
 }
 
 /** One row a `composer.atCompletions` source offers for the current query. */
@@ -115,13 +140,16 @@ export interface ComposerAttachmentProvider {
 export async function runComposerMiddleware(
   draft: ComposerDraft,
   context: ComposerContextValue = EMPTY_COMPOSER_CONTEXT
-): Promise<ComposerDraft | null> {
+): Promise<PreparedComposerDraft | null> {
   let current = draft
+  const commitCallbacks: Array<() => void> = []
 
   // Runtime plugins receive one immutable identity snapshot for the chain.
   // In particular, a tile/background session must never fall back to the
   // globally active ChatBar while an async middleware is running.
   const middlewareContext: ComposerContextValue = Object.freeze({
+    connectionId: context.connectionId,
+    profile: context.profile,
     runtimeSessionId: context.runtimeSessionId,
     storedSessionId: context.storedSessionId
   })
@@ -134,19 +162,53 @@ export async function runComposerMiddleware(
     }
 
     try {
-      const next = await middleware.handler(current, middlewareContext)
+      const output = await middleware.handler(current, middlewareContext)
 
-      if (next === null) {
+      if (output === null) {
         return null
       }
 
+      const declaredResult = !('text' in output) && 'draft' in output
+      const next = declaredResult ? output.draft : output
+
+      if (declaredResult && output.onCommit !== undefined && typeof output.onCommit !== 'function') {
+        throw new TypeError('composer middleware onCommit must be a function')
+      }
+
       current = next
+
+      if (declaredResult && output.onCommit) {
+        commitCallbacks.push(output.onCommit)
+      }
     } catch {
       // Pass-through: a faulty middleware must never swallow the message.
     }
   }
 
-  return current
+  if (commitCallbacks.length === 0) {
+    return { draft: current }
+  }
+
+  let committed = false
+
+  const commit = () => {
+    if (committed) {
+      return
+    }
+
+    committed = true
+
+    for (const callback of commitCallbacks) {
+      try {
+        callback()
+      } catch {
+        // The send is already admitted. One plugin cannot veto it or prevent
+        // later callbacks from observing the same committed operation.
+      }
+    }
+  }
+
+  return { commit, draft: current }
 }
 
 /** Attach-menu entries contributed by plugins/core, with stable render keys. */

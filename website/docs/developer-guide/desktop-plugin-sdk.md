@@ -349,23 +349,41 @@ ctx.register({ id: 'noir', area: THEMES_AREA, data: myDesktopTheme })
 `COMPOSER_AREAS` (`top`, `bottom`, `leading`, `actions`, `attachments`,
 `middleware`) let a plugin add controls around the message composer, provide an
 attachment source, or transform a draft before it is sent (`ComposerMiddleware`
-with a `handler(draft, context) => draft | null`). Returning `null` cancels the
-operation. The immutable context belongs to the exact ChatBar performing the
-submission:
+with a `handler(draft, context) => draft | { draft, onCommit } | null`). Returning
+`null` cancels the operation. `onCommit` is an optional renderer-local, one-shot
+callback: it runs immediately before the first real `prompt.submit`, after the
+target/backend/queue admission checks pass. It does not run for a cancelled or
+stale request, is never serialized to the gateway, and one callback throwing
+does not block the send or other callbacks. The immutable context belongs to the
+exact ChatBar performing the submission:
 
 ```ts
 interface ComposerContextValue {
+  connectionId: string | null
+  profile: string
   runtimeSessionId: string | null
   storedSessionId: string | null
 }
 ```
 
+`connectionId` and `profile` identify the exact backend route serving the
+composer (`connectionId` is `null` only when a legacy route has no registry
+identity). They are part of the submission identity, not presentation metadata:
+two backends can expose the same session ids.
 `storedSessionId` is the composer's durable queue/session key (including
 lineage-root resolution); use it to scope per-chat intent.
 `runtimeSessionId` identifies the live gateway stream. Render contributions can
 read the same scoped value with `useComposerContext()`. Do not substitute
 `host.state.activeSessionId`: a background tile or queued session can submit
 while a different conversation is globally active.
+
+Backend `pre_llm_call` hooks receive both `session_id` and `conversation_id`.
+The former is the current physical session segment; the latter is stable across
+context-compression rotations. `conversation_id` uses the same fork-aware
+lineage contract as prompt caching, so branches, delegate agents, and tool
+children remain isolated. Plugins that keep conversation-scoped state should
+key it by `conversation_id` and may remember the physical-to-logical mapping
+for later middleware and output hooks in the same turn.
 
 ### Transcript directives — inline components the model addresses
 
@@ -477,7 +495,8 @@ ctx.os.openExternal(url)                   // OS default handler (browser, mail,
 ctx.os.revealPath(path)                    // reveal in Finder / Explorer → Promise<boolean>
 ctx.os.writeClipboard(text)                // system clipboard → Promise<boolean>
 host.navigate('/route')                    // hash-route navigation
-host.submitText(text, { runtimeSessionId, storedSessionId }) // native composer send; Promise<boolean>
+host.submitText(text, { connectionId, profile, runtimeSessionId, storedSessionId })
+                                           // native composer send; Promise<boolean>
 host.openSession(id, { profile?, intent? }) // open a stored session core-style;
                                            //   profile: soft-swap to that profile's backend first
                                            //   intent: 'in-place' (default) | 'stack' | 'tab' | 'window'
@@ -499,12 +518,24 @@ host.request<T>(method, params?)           // active-gateway JSON-RPC — the re
 
 `host.submitText` is for an explicit plugin UI action that needs to submit
 through the same composer middleware and gateway path as typed text. Capture
-both ids from `useComposerContext()` (or the focused-session atoms) before the
-async action starts. The host returns `false` without sending when either id is
-missing, the pair is stale or unmounted, that chat is busy, it already has
-queued prompts, or the native submit rejects. It never retargets to whichever
-chat became active later and it never bypasses middleware with a direct
+the complete `{ connectionId, profile, runtimeSessionId, storedSessionId }`
+value from `useComposerContext()` before the async action starts. The host
+returns `false` without sending when either session id is missing, the backend
+or session snapshot is stale/unmounted, the gateway reconnects, that chat is
+busy, it has a queued prompt or queue edit, middleware cancels, or the native
+submit rejects. A claimed request is cancellable while async middleware and
+native preparation run, with a five-minute upper bound; cancellation cannot
+later fall through to `prompt.submit`. It never retargets to whichever chat or
+backend became active later and it never bypasses middleware with a direct
 `prompt.submit` request.
+
+For source compatibility, callers compiled against the first `submitText`
+contract may omit `connectionId` and `profile`; the host snapshots the current
+backend at call time. New async actions must pass all four fields so a registry
+backend switch that happens before the call is also detectable. A legacy route
+that exposes no registry id can only be pinned from the moment `submitText` is
+called; its internal connection fingerprint still prevents a switch while the
+submission is in flight.
 
 `host.request` is the same JSON-RPC the app itself uses (sessions, config, skills,
 cron, kanban, …). `host.requestProfile` accepts a descriptor from

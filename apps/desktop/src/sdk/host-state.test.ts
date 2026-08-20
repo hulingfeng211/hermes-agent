@@ -175,6 +175,8 @@ describe('host.state busy vs gateway', () => {
   it('submits only to the exact main or tile composer identity', async () => {
     const targets: string[] = []
 
+    $gatewayState.set('open')
+
     const off = onComposerSubmitRequest(detail => {
       if (!detail.claim()) {
         return
@@ -227,6 +229,18 @@ describe('host.state busy vs gateway', () => {
         storedSessionId: 'stored-tile'
       })
     ).resolves.toBe(true)
+
+    $sessionTiles.set([
+      { runtimeId: 'runtime-tile', storedSessionId: 'stored-tile' },
+      { runtimeId: 'runtime-main', storedSessionId: 'stored-main' }
+    ])
+    await expect(
+      host.submitText('ambiguous surface', {
+        runtimeSessionId: 'runtime-main',
+        storedSessionId: 'stored-main'
+      })
+    ).resolves.toBe(false)
+
     await expect(
       host.submitText('stale question', {
         runtimeSessionId: 'runtime-stale',
